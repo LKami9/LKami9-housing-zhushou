@@ -56,6 +56,9 @@ public sealed class LKami9HousingHelper : ModuleBase
 
     public override bool HasSettings => true;
 
+    /// <summary>代码版本（只用于日志：一眼看出游戏里编的是哪一版）。</summary>
+    private const string ModuleVersion = "1.1.2";
+
     // 宿主按「以 Config 结尾的成员」绑定已保存的配置；不能是 readonly
     private LKami9HousingHelperConfig config = new();
 
@@ -78,6 +81,7 @@ public sealed class LKami9HousingHelper : ModuleBase
     private int jobSrcNow;                                 // 状态行用的源侧当前件数
     private int prepPhase;                                 // 0=不用准备 1=等几帧 2=已发载入指令 3=仓库存档就绪
     private int prepWait;
+    private int prepStepsDone;                             // 准备阶段已经发过几条载入指令
     private string status = "空闲。先站到自己家里，再点下面两个按钮。";
 
     private readonly HashSet<(int Container, int Slot)> jobTried = [];
@@ -115,6 +119,8 @@ public sealed class LKami9HousingHelper : ModuleBase
         {
             DalamudServices.Framework.Update += this.OnFrameworkTick;
             this.frameworkHooked = true;
+            DalamudServices.PluginLog.Information(
+                $"[装修助手] 模块已加载，代码版本 v{ModuleVersion}（开工前自动载入房屋仓库）");
         }
         catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[装修助手] 注册框架更新失败"); }
     }
@@ -489,6 +495,7 @@ public sealed class LKami9HousingHelper : ModuleBase
     private void StartJob(MoveKind kind)
     {
         var what = kind == MoveKind.Store ? "存入" : "取出";
+        DalamudServices.PluginLog.Information($"[装修助手] ===== 开始{what}（代码版本 v{ModuleVersion}）=====");
 
         // ① 建索引（失败也照样往下走，日志里能看到数量）
         this.LoadFurnitureIndexIfNeeded();
@@ -592,20 +599,20 @@ public sealed class LKami9HousingHelper : ModuleBase
 
     /// <summary>
     /// 开工前的「仓库载入」准备：逐帧推进（同一帧连发多条指令游戏只会处理一条）。
+    /// 依次试三条「载入/请求仓库」指令，哪条都不行就明确报因，不再空发搬运指令。
     /// 返回 true = 本次帧已被准备流程占用，搬运逻辑这帧不要动。
     /// </summary>
     private unsafe bool PrepTick()
     {
         if (this.prepPhase >= 3) return false;
 
-        var phase = this.prepPhase;
-        if (phase == 1)
+        // phase 1：先等 6 帧（让「准备中」的状态行显示出来），再发第 1 条载入指令
+        if (this.prepPhase == 1)
         {
-            // 等 6 帧，让「开始」的状态行先显示出来，再发指令
             if (this.prepWait++ < 6) return true;
 
             var house = GetHouseInfo();
-            if (house.LowId == 0 && house.HighId == 0)
+            if (house.HighId == 0 && house.LowId == 0)
             {
                 DalamudServices.PluginLog.Information("[装修助手] 准备失败：不在自家房屋区域，发不了载入指令");
                 this.job = MoveKind.None;
@@ -614,48 +621,89 @@ public sealed class LKami9HousingHelper : ModuleBase
                 return true;
             }
 
-            HousingCommand.LoadInteriorFurnish();
-            DalamudServices.PluginLog.Information(
-                $"[装修助手] 准备：已发「载入室内家具仓库」指令（房屋 {house.HighId:X8}:{house.LowId:X8}），等 2 秒");
+            this.PrepSendStep(0, house);
             this.prepPhase = 2;
             this.prepWait = 0;
             return true;
         }
 
-        // phase == 2：等仓库载入。每帧读一次原生容器（只读，没有副作用）
+        // phase 2：每帧读一次原生容器（只读，无副作用），看仓库有没有载入
         if (this.AnyContainerLoaded(StoreroomContainers))
         {
-            var (n, detail) = this.CountWithDetail(StoreroomContainers, null);
-            DalamudServices.PluginLog.Information($"[装修助手] 准备完成：房屋仓库已载入，共 {n} 件，明细 {detail}");
-            this.prepPhase = 3;
-            this.jobDoneFrames = 0;
-            var srcTypes = this.job == MoveKind.Store ? BagContainers : StoreroomContainers;
-            var (again, _) = this.CountWithDetail(srcTypes, null);
-            this.jobStartCount = again;
-            this.jobDoneBaseline = again;
-            this.status = this.job == MoveKind.Store
-                ? $"开始存入：共 {this.jobStartMatch} 件家具/庭具…"
-                : $"开始取出：仓库里共 {again} 件…";
-            DalamudServices.PluginLog.Information(
-                $"[装修助手] 开始{(this.job == MoveKind.Store ? "存入" : "取出")}：源侧 {again} 件（要搬 {this.jobStartMatch} 件），每件间隔 {this.jobIntervalFrames} 帧");
+            this.PrepDone();
             return false;
         }
 
-        if (this.prepWait++ < 120)   // 约 2 秒
+        if (this.prepWait++ < 60)   // 每步给约 1 秒
+            return true;
+
+        if (this.prepStepsDone < PrepStepNames.Length)
         {
-            if (this.prepWait % 30 == 0)
-                DalamudServices.PluginLog.Information($"[装修助手] 准备中…（等房屋仓库载入，第 {this.prepWait} 帧）");
+            var house = GetHouseInfo();
+            this.PrepSendStep(this.prepStepsDone, house);
+            this.prepWait = 0;
             return true;
         }
 
-        // 2 秒还没载入 → 不再硬发指令（会被游戏无视），把原因说明白
+        // 三条都发过还是没载入 → 不再硬发（会被游戏无视），把原因说明白
         DalamudServices.PluginLog.Information(
-            "[装修助手] 准备失败：发了「载入室内家具仓库」指令后 2 秒，仓库容器仍未载入"
-            + "（27000/27200 也还是「无」）→ 需要玩家手动打开「家具/庭具仓库」窗口");
+            "[装修助手] 准备失败：依次发过「载入室内家具仓库」「载入院内庭具仓库」「请求仓库状态」三条指令，"
+            + "仓库容器（27000/27001..27011）仍未载入 → 需要玩家手动打开「家具/庭具仓库」窗口");
         this.job = MoveKind.None;
         this.prepPhase = 0;
         this.status = "没能自动载入房屋仓库 —— 请先在自己家（或院子里）打开「家具/庭具仓库」窗口，再点一次。";
         return true;
+    }
+
+    /// <summary>准备阶段依次尝试的三条指令（日志里会说清是哪一步生效的）。</summary>
+    private static readonly string[] PrepStepNames =
+    [
+        "载入室内家具仓库（LoadInteriorFurnish）",
+        "载入院内庭具仓库（LoadExteriorFurnish）",
+        "请求仓库状态（RequestStoreroomStatus）",
+    ];
+
+    private unsafe void PrepSendStep(int index, HouseInfo house)
+    {
+        switch (index)
+        {
+            case 0:
+                HousingCommand.LoadInteriorFurnish();
+                break;
+            case 1:
+                HousingCommand.LoadExteriorFurnish();
+                break;
+            default:
+                HousingCommand.RequestStoreroomStatus(house.HighId, house.LowId);
+                break;
+        }
+
+        this.prepStepsDone = index + 1;
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 准备第 {index + 1} 步：{PrepStepNames[index]}（房屋 {house.HighId:X8}:{house.LowId:X8}），等 1 秒");
+    }
+
+    /// <summary>仓库载入成功 → 正式开工。</summary>
+    private void PrepDone()
+    {
+        var (n, detail) = this.CountWithDetail(StoreroomContainers, null);
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 准备完成：房屋仓库已载入（约在第 {this.prepStepsDone} 步之后），共 {n} 件，明细 {detail}");
+
+        this.prepPhase = 3;
+        this.prepWait = 0;
+        this.jobDoneFrames = 0;
+
+        var srcTypes = this.job == MoveKind.Store ? BagContainers : StoreroomContainers;
+        var (again, _) = this.CountWithDetail(srcTypes, null);
+        this.jobStartCount = again;
+        this.jobDoneBaseline = again;
+
+        this.status = this.job == MoveKind.Store
+            ? $"开始存入：共 {this.jobStartMatch} 件家具/庭具…"
+            : $"开始取出：仓库里共 {again} 件…";
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 开始{(this.job == MoveKind.Store ? "存入" : "取出")}：源侧 {again} 件（要搬 {this.jobStartMatch} 件），每件间隔 {this.jobIntervalFrames} 帧");
     }
 
     private void StopJob(string why)
