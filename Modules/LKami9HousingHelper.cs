@@ -8,6 +8,7 @@ using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.UI;
 
 using Lumina.Excel.Sheets;
 
@@ -57,7 +58,7 @@ public sealed class LKami9HousingHelper : ModuleBase
     public override bool HasSettings => true;
 
     /// <summary>代码版本（只用于日志：一眼看出游戏里编的是哪一版）。</summary>
-    private const string ModuleVersion = "1.1.2";
+    private const string ModuleVersion = "1.1.3";
 
     // 宿主按「以 Config 结尾的成员」绑定已保存的配置；不能是 readonly
     private LKami9HousingHelperConfig config = new();
@@ -79,7 +80,7 @@ public sealed class LKami9HousingHelper : ModuleBase
     private int jobDoneBaseline;
     private int jobSrcRefresh;                             // 状态行的源侧件数刷新计数
     private int jobSrcNow;                                 // 状态行用的源侧当前件数
-    private int prepPhase;                                 // 0=不用准备 1=等几帧 2=已发载入指令 3=仓库存档就绪
+    private int prepPhase;                                 // 0=不用准备 1=等几帧 2=发指令+等载入 3=仓库存档就绪 4=等玩家手动开窗
     private int prepWait;
     private int prepStepsDone;                             // 准备阶段已经发过几条载入指令
     private string status = "空闲。先站到自己家里，再点下面两个按钮。";
@@ -558,8 +559,8 @@ public sealed class LKami9HousingHelper : ModuleBase
 
         var ready = this.AnyContainerLoaded(StoreroomContainers);
         DalamudServices.PluginLog.Information(
-            $"[装修助手] 前置⑤仓库存档：已载入={ready}"
-            + (ready ? "" : "（没载入 → 先发一次载入指令，等 2 秒再说；游戏不接受指令时源侧不会变少）"));
+            $"[装修助手] 前置⑤仓库存档：已载入={ready} 仓库窗口={DescribeStoreroomWindow()}"
+            + (ready ? "" : "（没载入 → 自动依次发 5 条载入/请求指令；都不行就等你手动开「家具/庭具仓库」窗口）"));
 
         this.job = kind;
         this.jobWait = 0;
@@ -598,18 +599,20 @@ public sealed class LKami9HousingHelper : ModuleBase
     }
 
     /// <summary>
-    /// 开工前的「仓库载入」准备：逐帧推进（同一帧连发多条指令游戏只会处理一条）。
-    /// 依次试三条「载入/请求仓库」指令，哪条都不行就明确报因，不再空发搬运指令。
-    /// 返回 true = 本次帧已被准备流程占用，搬运逻辑这帧不要动。
+    /// 开工前的「仓库载入」准备：逐帧推进（同一帧连发多条指令游戏只处理一条）。
+    /// 自动依次试 5 条「载入/请求仓库」指令；全都不行就转入「等玩家手动开窗」，
+    /// 玩家一打开「家具/庭具仓库」窗口就立刻开工（不用再点一次按钮）。
+    /// 返回 true = 这帧已被准备流程占用，搬运逻辑不要动。
     /// </summary>
     private unsafe bool PrepTick()
     {
         if (this.prepPhase >= 3) return false;
 
-        // phase 1：先等 6 帧（让「准备中」的状态行显示出来），再发第 1 条载入指令
+        // phase 1：先等 6 帧（让「准备中」的状态行显示出来），再发第 1 条指令
         if (this.prepPhase == 1)
         {
             if (this.prepWait++ < 6) return true;
+            this.prepWait = 0;
 
             var house = GetHouseInfo();
             if (house.HighId == 0 && house.LowId == 0)
@@ -621,9 +624,42 @@ public sealed class LKami9HousingHelper : ModuleBase
                 return true;
             }
 
-            this.PrepSendStep(0, house);
             this.prepPhase = 2;
-            this.prepWait = 0;
+            this.PrepSendStep(0, house);
+            return true;
+        }
+
+        // phase 4：自动指令全失败 → 等玩家手动打开「家具/庭具仓库」窗口（最多 1 分钟）
+        if (this.prepPhase == 4)
+        {
+            if (this.AnyContainerLoaded(StoreroomContainers))
+            {
+                this.PrepDone();
+                return false;
+            }
+
+            if (this.prepWait >= PrepManualWaitFrames)
+            {
+                DalamudServices.PluginLog.Information(
+                    $"[装修助手] 准备失败：{PrepStepNames.Length} 条自动指令 + 等 {PrepManualWaitFrames / 60} 秒都没读到仓库，"
+                    + $"仓库窗口={DescribeStoreroomWindow()}，容器明细 {this.CountWithDetail(StoreroomContainers, null).Detail}"
+                    + " → 需要玩家手动打开「家具/庭具仓库」窗口");
+                this.job = MoveKind.None;
+                this.prepPhase = 0;
+                this.status = "读不到房屋仓库 —— 请在自己家（或院子里）打开「家具/庭具仓库」窗口，再点一次。";
+                return true;
+            }
+
+            if (this.prepWait % 300 == 0)   // 每 5 秒提示一次
+            {
+                var leftSec = (PrepManualWaitFrames - this.prepWait) / 60;
+                DalamudServices.PluginLog.Information(
+                    $"[装修助手] 等待手动开窗：请在自家（或院子里）打开「家具/庭具仓库」窗口（还剩约 {leftSec} 秒），"
+                    + $"当前仓库窗口={DescribeStoreroomWindow()}");
+                this.status = $"请打开「家具/庭具仓库」窗口（还剩约 {leftSec} 秒，打开就自动开始）";
+            }
+
+            this.prepWait++;
             return true;
         }
 
@@ -634,38 +670,45 @@ public sealed class LKami9HousingHelper : ModuleBase
             return false;
         }
 
-        if (this.prepWait++ < 60)   // 每步给约 1 秒
-            return true;
+        if (this.prepWait++ < PrepStepWaitFrames) return true;
 
         if (this.prepStepsDone < PrepStepNames.Length)
         {
-            var house = GetHouseInfo();
-            this.PrepSendStep(this.prepStepsDone, house);
-            this.prepWait = 0;
+            this.PrepSendStep(this.prepStepsDone, GetHouseInfo());
             return true;
         }
 
-        // 三条都发过还是没载入 → 不再硬发（会被游戏无视），把原因说明白
+        // 自动指令全试过还是没载入 → 不再硬发（会被游戏无视），转为等玩家手动开窗
         DalamudServices.PluginLog.Information(
-            "[装修助手] 准备失败：依次发过「载入室内家具仓库」「载入院内庭具仓库」「请求仓库状态」三条指令，"
-            + "仓库容器（27000/27001..27011）仍未载入 → 需要玩家手动打开「家具/庭具仓库」窗口");
-        this.job = MoveKind.None;
-        this.prepPhase = 0;
-        this.status = "没能自动载入房屋仓库 —— 请先在自己家（或院子里）打开「家具/庭具仓库」窗口，再点一次。";
+            $"[装修助手] 自动载入没生效（已依次发过 {PrepStepNames.Length} 条指令），"
+            + $"仓库窗口={DescribeStoreroomWindow()} → 转为等玩家手动打开「家具/庭具仓库」窗口（最多 {PrepManualWaitFrames / 60} 秒）");
+        this.prepPhase = 4;
+        this.prepWait = 0;
         return true;
     }
 
-    /// <summary>准备阶段依次尝试的三条指令（日志里会说清是哪一步生效的）。</summary>
+    /// <summary>每条载入/请求指令给多少帧（60 帧 ≈ 1 秒）。</summary>
+    private const int PrepStepWaitFrames = 90;
+
+    /// <summary>自动指令全失败后，再等玩家手动开窗多少帧（3600 帧 ≈ 60 秒）。</summary>
+    private const int PrepManualWaitFrames = 3600;
+
+    /// <summary>准备阶段依次尝试的载入/请求指令（日志里会说清是哪一步生效的）。</summary>
     private static readonly string[] PrepStepNames =
     [
-        "载入室内家具仓库（LoadInteriorFurnish）",
-        "载入院内庭具仓库（LoadExteriorFurnish）",
-        "请求仓库状态（RequestStoreroomStatus）",
+        "载入室内家具仓库（LoadInteriorFurnish 1111）",
+        "载入院内庭具仓库（LoadExteriorFurnish 1110）",
+        "请求仓库状态（RequestStoreroomStatus 1151）",
+        "再试一次载入室内家具仓库（1111）",
+        "再试一次请求仓库状态（1151）",
     ];
+
+    /// <summary>每条指令对应哪个动作：0=室内家具 1=院内庭具 2=请求仓库状态。</summary>
+    private static readonly int[] PrepStepAction = [0, 1, 2, 0, 2];
 
     private unsafe void PrepSendStep(int index, HouseInfo house)
     {
-        switch (index)
+        switch (PrepStepAction[index])
         {
             case 0:
                 HousingCommand.LoadInteriorFurnish();
@@ -679,8 +722,25 @@ public sealed class LKami9HousingHelper : ModuleBase
         }
 
         this.prepStepsDone = index + 1;
+        this.prepWait = 0;
+
+        var leftSec = (PrepStepNames.Length - index - 1) * PrepStepWaitFrames / 60f;
         DalamudServices.PluginLog.Information(
-            $"[装修助手] 准备第 {index + 1} 步：{PrepStepNames[index]}（房屋 {house.HighId:X8}:{house.LowId:X8}），等 1 秒");
+            $"[装修助手] 准备第 {index + 1}/{PrepStepNames.Length} 步：{PrepStepNames[index]}"
+            + $"（房屋 {house.HighId:X8}:{house.LowId:X8}，仓库窗口={DescribeStoreroomWindow()}），等 1.5 秒");
+        this.status = $"正在载入房屋仓库…（第 {index + 1}/{PrepStepNames.Length} 步，别点停止，还剩约 {leftSec:0.#} 秒）";
+    }
+
+    /// <summary>看一眼「家具/庭具仓库」窗口（HousingGoods）什么状态 —— 只读，用来判断指令有没有把窗口叫出来。</summary>
+    private static unsafe string DescribeStoreroomWindow()
+    {
+        var manager = RaptureAtkUnitManager.Instance();
+        if (manager == null) return "读不到(AtkUnitManager)";
+
+        var addon = manager->GetAddonByName("HousingGoods");
+        if (addon == null) return "未打开";
+
+        return addon->IsVisible ? "已打开" : "已创建未显示";
     }
 
     /// <summary>仓库载入成功 → 正式开工。</summary>
