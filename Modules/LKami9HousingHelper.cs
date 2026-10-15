@@ -25,11 +25,18 @@ namespace LKami9.HousingHelper;
 /// <summary>
 /// LKami9装修助手 —— 批量搬运家具/庭具。
 ///
-/// 四个动作（全部走 OmenTools 的公开指令 API，不碰内存）：
-///   · 批量存入     ：背包 家具/庭具 → 房屋仓库          HousingCommand.Store(背包, 槽)
+/// 四个动作（全部走 OmenTools 的公开指令 API / 游戏自己的容器搬运函数，不写内存）：
+///   · 批量存入     ：背包 家具/庭具 → 房屋仓库          InventoryManager.MoveItemSlot(背包, 槽, 仓库页, 空槽, false)  ★实测有效
 ///   · 批量取出     ：房屋仓库 家具/庭具 → 背包          HousingCommand.Restore(仓库, 槽, toStoreRoom:false)
 ///   · 收回布置→背包：屋里/院里已摆放的 → 背包           HousingCommand.Restore(已布置, 槽, toStoreRoom:false)
 ///   · 收回布置→仓库：屋里/院里已摆放的 → 房屋仓库       HousingCommand.Restore(已布置, 槽, toStoreRoom:true)
+///
+/// 【存入为什么用 MoveItemSlot】2026-10-16 04:39 实测：`StoreFurniture`(1112)、`RestoreFurniture`(1113+移仓标记)、
+/// 1112 带「目标仓库页」三种 ExecuteCommand 发法**全被游戏静默丢弃**（源侧一件不少）；
+/// 04:45 改用游戏自己的容器搬运函数 `MoveItemSlot(背包, 槽, 仓库页, 空槽, 末参 false)` 后立刻生效
+/// （日志「MoveItemSlot(1,14 → 27001,16, 末参:False) 返回 0」，源侧 114→111）。
+/// 注意末参 **必须 false** —— 传 true 时不搬（返回码同样是 0，所以返回码不能当成功判据，要看源侧件数）。
+/// 这个函数是 DailyRoutines「快速存雇员」同款（它就是拿它搬背包 → 雇员）。
 ///
 /// 容器号来自 FFXIVClientStructs 的 InventoryType（与 DailyRoutines 的「自动取回家具」同源）：
 ///   背包        Inventory1..4                  （0..3）
@@ -49,7 +56,7 @@ public sealed class LKami9HousingHelper : ModuleBase
     public override ModuleInfo Info { get; } = new()
     {
         Title       = "LKami9装修助手",
-        Description = "批量搬家具：背包 → 仓库、仓库 → 背包，以及把屋里/院里已摆放的家具庭具收回背包或仓库。需要在自己家/院子里，并打开家具界面（家具/庭具窗口）。",
+        Description = "批量搬家具：背包 → 仓库、仓库 → 背包，以及把屋里/院里已摆放的家具庭具收回背包或仓库。需要在自己家/院子里，并打开家具界面（家具/庭具窗口）。四个功能均已实测可用。",
         Category    = ModuleCategory.Automation,
         Author      = "LKami9",
         Commands    =
@@ -64,7 +71,7 @@ public sealed class LKami9HousingHelper : ModuleBase
     public override bool HasSettings => true;
 
     /// <summary>代码版本（只用于日志：一眼看出游戏里编的是哪一版）。</summary>
-    private const string ModuleVersion = "1.2.2";
+    private const string ModuleVersion = "1.3.0";
 
     // 宿主按「以 Config 结尾的成员」绑定已保存的配置；不能是 readonly
     private LKami9HousingHelperConfig config = new();
@@ -73,6 +80,8 @@ public sealed class LKami9HousingHelper : ModuleBase
     private enum MoveKind { None, Store, StoreAsStore, StoreAsDest, StoreByMove, StoreByMoveNoFlag, TakeOut, RetrieveToBag, RetrieveToStore }
 
     private MoveKind job = MoveKind.None;
+    private int storeLadderStep;                           // 「存入」当前在第几种发法
+    private int storeLadderPass;                           // 「存入」整套发法跑到第几轮
     private int jobWait;                                   // 距上一件过了几帧
     private int jobIntervalFrames = 19;                    // 每件之间隔多少帧（≈300ms）
     private (int Container, int Slot) jobCurrent = (-1, -1);
@@ -208,7 +217,7 @@ public sealed class LKami9HousingHelper : ModuleBase
         using (ImRaii.Disabled(busy))
         {
             if (ImGui.Button("批量存入（背包 → 仓库）")) this.StartJob(MoveKind.Store);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("背包里的 家具/庭具 全部存进房屋仓库");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("背包里的 家具/庭具 全部存进房屋仓库（原生搬运，已实测可用）");
             ImGui.SameLine();
             if (ImGui.Button("批量取出（仓库 → 背包）")) this.StartJob(MoveKind.TakeOut);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("房屋仓库里的 家具/庭具 全部取回背包");
@@ -372,11 +381,8 @@ public sealed class LKami9HousingHelper : ModuleBase
     /// <summary>动作名（日志/界面用）。</summary>
     private static string ActionName(MoveKind kind) => kind switch
     {
-        MoveKind.Store => "存入（背包 → 仓库）",
-        MoveKind.StoreAsStore => "存入·改用 1113（背包 → 仓库）",
-        MoveKind.StoreAsDest => "存入·第 3 参当目标仓库页（背包 → 仓库）",
-        MoveKind.StoreByMove => "存入·改用原生 MoveItemSlot（背包 → 仓库）",
-        MoveKind.StoreByMoveNoFlag => "存入·原生 MoveItemSlot（末参 false）",
+        MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest
+            or MoveKind.StoreByMove or MoveKind.StoreByMoveNoFlag => "存入（背包 → 仓库）",
         MoveKind.RetrieveToBag => "收回已布置 → 背包",
         MoveKind.RetrieveToStore => "收回已布置 → 仓库",
         _ => "取出（仓库 → 背包）",
@@ -617,8 +623,18 @@ public sealed class LKami9HousingHelper : ModuleBase
 
     private void StartJob(MoveKind kind)
     {
+        // 「存入」从「实测有效的那种发法」开始；后面一件都没搬动就按 StoreLadder 依次换招。
+        if (IsStoreKind(kind))
+        {
+            this.storeLadderStep = 0;
+            this.storeLadderPass = 0;
+            kind = StoreLadder[0];
+        }
+
         var what = ActionName(kind);
         DalamudServices.PluginLog.Information($"[装修助手] ===== 开始{what}（代码版本 v{ModuleVersion}）=====");
+        if (IsStoreKind(kind))
+            DalamudServices.PluginLog.Information($"[装修助手] 存入发法：{StoreMethodName(kind)}");
 
         // ① 建索引（失败也照样往下走，日志里能看到数量）
         this.LoadFurnitureIndexIfNeeded();
@@ -857,6 +873,32 @@ public sealed class LKami9HousingHelper : ModuleBase
             $"[装修助手] 开始{ActionName(this.job)}：源侧 {again} 件（要搬 {this.jobStartMatch} 件），每件间隔 {this.jobIntervalFrames} 帧");
     }
 
+    /// <summary>是不是「存入」这一族（背包 → 仓库）。</summary>
+    private static bool IsStoreKind(MoveKind kind) =>
+        kind is MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest
+             or MoveKind.StoreByMove or MoveKind.StoreByMoveNoFlag;
+
+    /// <summary>「存入」的 5 种发法，按「实测有效」的顺序排（第一个是 2026-10-16 04:45 实测成功的）。</summary>
+    private static readonly MoveKind[] StoreLadder =
+    [
+        MoveKind.StoreByMoveNoFlag,   // ✅ MoveItemSlot(背包, 槽 → 仓库空槽, 末参 false)
+        MoveKind.Store,               //    指令 1112 StoreFurniture(背包, 槽)
+        MoveKind.StoreAsStore,        //    指令 1113 RestoreFurniture(背包, 槽 + 0x10000)
+        MoveKind.StoreAsDest,         //    指令 1112（第 3 参当目标仓库页）
+        MoveKind.StoreByMove,         //    MoveItemSlot(…, 末参 true)
+    ];
+
+    /// <summary>发法的名字（日志里用，能一眼看出这条日志是哪一招）。</summary>
+    private static string StoreMethodName(MoveKind kind) => kind switch
+    {
+        MoveKind.StoreByMoveNoFlag => "原生搬运 MoveItemSlot(末参 false)【实测有效】",
+        MoveKind.StoreByMove => "原生搬运 MoveItemSlot(末参 true)",
+        MoveKind.Store => "指令 1112 StoreFurniture",
+        MoveKind.StoreAsStore => "指令 1113 RestoreFurniture+移仓标记",
+        MoveKind.StoreAsDest => "指令 1112（第 3 参当目标仓库页）",
+        _ => kind.ToString(),
+    };
+
     /// <summary>「存入」换招：清空重试状态并把同一批从头试一遍（含重新请求仓库上下文）。</summary>
     private void SwitchStoreVariant(MoveKind next, string log)
     {
@@ -945,42 +987,32 @@ public sealed class LKami9HousingHelper : ModuleBase
                 // 「存入」专用：三种发法依次实测（这条指令到底认哪个参数，只有试了才知道）。
                 // 只在「一件都没搬动」时换招，避免把单件失败误判成整条路走不通。
                 var srcNow = this.CountInContainers(BagContainers, null);
-                var inStoreFamily = this.job is MoveKind.Store or MoveKind.StoreAsStore
-                                    or MoveKind.StoreAsDest or MoveKind.StoreByMove or MoveKind.StoreByMoveNoFlag;
+                // 「存入」换招：一条都不动就换下一种发法；整套（5 种）试完再来一遍
+                // （有的发法需要前面几条指令把游戏侧的上下文"热"起来才生效，所以留了两轮）。
+                var inStoreFamily = IsStoreKind(this.job);
                 var nothingMoved = inStoreFamily && srcNow >= this.jobStartCount;
 
-                if (nothingMoved && this.job == MoveKind.Store)
+                if (nothingMoved)
                 {
-                    this.SwitchStoreVariant(MoveKind.StoreAsStore,
-                        "存入：1112（StoreFurniture）一件都没搬动 → 改用 1113（RestoreFurniture + 移到仓库标记）重试");
-                    return;
-                }
+                    this.storeLadderStep++;
+                    if (this.storeLadderStep < StoreLadder.Length)
+                    {
+                        this.SwitchStoreVariant(StoreLadder[this.storeLadderStep],
+                            $"存入：{StoreMethodName(this.job)} 一件都没搬动 → 换 {StoreMethodName(StoreLadder[this.storeLadderStep])} 重试");
+                        return;
+                    }
 
-                if (nothingMoved && this.job == MoveKind.StoreAsStore)
-                {
-                    this.SwitchStoreVariant(MoveKind.StoreAsDest,
-                        "存入：1113（带移仓标记）一件都没搬动 → 改用 1112，但把第 3 参当「目标仓库页」重试");
-                    return;
-                }
+                    this.storeLadderPass++;
+                    if (this.storeLadderPass < 2)
+                    {
+                        this.storeLadderStep = 0;
+                        this.SwitchStoreVariant(StoreLadder[0],
+                            $"存入：5 种发法都没搬动 → 第一轮结束，从头再来一遍（{StoreMethodName(StoreLadder[0])}）");
+                        return;
+                    }
 
-                if (nothingMoved && this.job == MoveKind.StoreAsDest)
-                {
-                    this.SwitchStoreVariant(MoveKind.StoreByMove,
-                        "存入：三条指令发法都不动 → 改用游戏自己的容器搬运函数 MoveItemSlot(末参 true) 重试");
-                    return;
-                }
-
-                if (nothingMoved && this.job == MoveKind.StoreByMove)
-                {
-                    this.SwitchStoreVariant(MoveKind.StoreByMoveNoFlag,
-                        "存入：MoveItemSlot(末参 true) 也不动 → 末参改 false 再试一次");
-                    return;
-                }
-
-                if (nothingMoved && this.job == MoveKind.StoreByMoveNoFlag)
-                {
-                    this.StopJob("存入失败：1112 / 1113+移仓标记 / 1112+目标仓库页 / MoveItemSlot(true) / MoveItemSlot(false) "
-                               + "五种发法游戏都不接受 —— 背包 → 仓库 目前走不通，请改用「收回已布置家具 → 仓库」或手动收纳。");
+                    this.StopJob("存入失败：5 种发法各试两轮游戏都不接受 —— 家具界面/仓库数据/位置都正常的话，"
+                               + "请把这段日志发我（这是唯一还缺的证据）。");
                     return;
                 }
 
