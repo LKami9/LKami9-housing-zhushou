@@ -6,10 +6,10 @@
       "Name": "LKami9装修助手",
       "Author": "LKami9",
       "Description": "批量搬家具：背包 → 仓库、仓库 → 背包，以及把屋里/院里已摆放的家具庭具收回背包或仓库。需要在自己家/院子里，并打开家具界面（家具/庭具窗口）。",
-      "Version": "1.2.1",
+      "Version": "1.2.2",
       "MinimumOmniVersion": "1.1.7.0",
       "File": "Modules/LKami9HousingHelper.cs",
-      "Sha256": "022A9B9B726414E8600E44321B1287EB8559A078A5408159501ABAF30B8D4ED0"
+      "Sha256": "EFD26C73FDA18295B04B45CFA936A5E5102B8A3F82426B8EAD493F2AB3BB7851"
     }
   ]
 }

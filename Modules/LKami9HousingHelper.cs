@@ -64,13 +64,13 @@ public sealed class LKami9HousingHelper : ModuleBase
     public override bool HasSettings => true;
 
     /// <summary>代码版本（只用于日志：一眼看出游戏里编的是哪一版）。</summary>
-    private const string ModuleVersion = "1.2.1";
+    private const string ModuleVersion = "1.2.2";
 
     // 宿主按「以 Config 结尾的成员」绑定已保存的配置；不能是 readonly
     private LKami9HousingHelperConfig config = new();
 
     // ── 搬运状态 ──
-    private enum MoveKind { None, Store, StoreAsStore, StoreAsDest, TakeOut, RetrieveToBag, RetrieveToStore }
+    private enum MoveKind { None, Store, StoreAsStore, StoreAsDest, StoreByMove, StoreByMoveNoFlag, TakeOut, RetrieveToBag, RetrieveToStore }
 
     private MoveKind job = MoveKind.None;
     private int jobWait;                                   // 距上一件过了几帧
@@ -354,7 +354,8 @@ public sealed class LKami9HousingHelper : ModuleBase
     /// <summary>这个动作的「源侧容器」是哪一批。</summary>
     private static InventoryType[] SourceContainers(MoveKind kind) => kind switch
     {
-        MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest => BagContainers,
+        MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest
+            or MoveKind.StoreByMove or MoveKind.StoreByMoveNoFlag => BagContainers,
         MoveKind.RetrieveToBag or MoveKind.RetrieveToStore => PlacedContainers,
         _ => StoreroomContainers,
     };
@@ -362,7 +363,8 @@ public sealed class LKami9HousingHelper : ModuleBase
     /// <summary>源侧的名字（日志/界面用）。</summary>
     private static string SourceNoun(MoveKind kind) => kind switch
     {
-        MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest => "背包",
+        MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest
+            or MoveKind.StoreByMove or MoveKind.StoreByMoveNoFlag => "背包",
         MoveKind.RetrieveToBag or MoveKind.RetrieveToStore => "已布置",
         _ => "仓库",
     };
@@ -373,10 +375,51 @@ public sealed class LKami9HousingHelper : ModuleBase
         MoveKind.Store => "存入（背包 → 仓库）",
         MoveKind.StoreAsStore => "存入·改用 1113（背包 → 仓库）",
         MoveKind.StoreAsDest => "存入·第 3 参当目标仓库页（背包 → 仓库）",
+        MoveKind.StoreByMove => "存入·改用原生 MoveItemSlot（背包 → 仓库）",
+        MoveKind.StoreByMoveNoFlag => "存入·原生 MoveItemSlot（末参 false）",
         MoveKind.RetrieveToBag => "收回已布置 → 背包",
         MoveKind.RetrieveToStore => "收回已布置 → 仓库",
         _ => "取出（仓库 → 背包）",
     };
+
+    /// <summary>存入换招时「目标仓库页」优先顺序（室内在前）。</summary>
+    private static readonly InventoryType[] StoreroomDestOrder =
+    [
+        InventoryType.HousingInteriorStoreroom1, InventoryType.HousingInteriorStoreroom2,
+        InventoryType.HousingInteriorStoreroom3, InventoryType.HousingInteriorStoreroom4,
+        InventoryType.HousingInteriorStoreroom5, InventoryType.HousingInteriorStoreroom6,
+        InventoryType.HousingInteriorStoreroom7, InventoryType.HousingInteriorStoreroom8,
+        InventoryType.HousingInteriorStoreroom9, InventoryType.HousingInteriorStoreroom10,
+        InventoryType.HousingInteriorStoreroom11,
+        InventoryType.HousingExteriorStoreroom, InventoryType.HousingExteriorStoreroom2,
+    ];
+
+    /// <summary>在房屋仓库里找一个空槽（没有 = 仓库满）。</summary>
+    private unsafe bool TryFindFreeStoreroomSlot(out InventoryType container, out ushort slot)
+    {
+        container = InventoryType.HousingInteriorStoreroom1;
+        slot = 0;
+
+        var mgr = InventoryManager.Instance();
+        if (mgr == null) return false;
+
+        foreach (var type in StoreroomDestOrder)
+        {
+            var cont = mgr->GetInventoryContainer(type);
+            if (cont == null || !cont->IsLoaded) continue;
+            for (var i = 0; i < cont->Size; i++)
+            {
+                var s = cont->GetInventorySlot(i);
+                if (s == null || s->ItemId == 0)
+                {
+                    container = type;
+                    slot = (ushort)i;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
     /// <summary>存入失败换招时用：把「仓库页」当第 3 参传的目标容器（室内 27001 / 站在院里时 27000）。</summary>
     private static unsafe InventoryType StoreroomDest()
@@ -902,8 +945,9 @@ public sealed class LKami9HousingHelper : ModuleBase
                 // 「存入」专用：三种发法依次实测（这条指令到底认哪个参数，只有试了才知道）。
                 // 只在「一件都没搬动」时换招，避免把单件失败误判成整条路走不通。
                 var srcNow = this.CountInContainers(BagContainers, null);
-                var nothingMoved = this.job is MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest
-                                   && srcNow >= this.jobStartCount;
+                var inStoreFamily = this.job is MoveKind.Store or MoveKind.StoreAsStore
+                                    or MoveKind.StoreAsDest or MoveKind.StoreByMove or MoveKind.StoreByMoveNoFlag;
+                var nothingMoved = inStoreFamily && srcNow >= this.jobStartCount;
 
                 if (nothingMoved && this.job == MoveKind.Store)
                 {
@@ -921,8 +965,22 @@ public sealed class LKami9HousingHelper : ModuleBase
 
                 if (nothingMoved && this.job == MoveKind.StoreAsDest)
                 {
-                    this.StopJob("存入的三种发法（1112 / 1113+移仓标记 / 1112+目标仓库页）游戏都不接受 —— "
-                               + "背包 → 仓库 这条路目前走不通，请改用「收回已布置家具 → 仓库」或手动收纳。");
+                    this.SwitchStoreVariant(MoveKind.StoreByMove,
+                        "存入：三条指令发法都不动 → 改用游戏自己的容器搬运函数 MoveItemSlot(末参 true) 重试");
+                    return;
+                }
+
+                if (nothingMoved && this.job == MoveKind.StoreByMove)
+                {
+                    this.SwitchStoreVariant(MoveKind.StoreByMoveNoFlag,
+                        "存入：MoveItemSlot(末参 true) 也不动 → 末参改 false 再试一次");
+                    return;
+                }
+
+                if (nothingMoved && this.job == MoveKind.StoreByMoveNoFlag)
+                {
+                    this.StopJob("存入失败：1112 / 1113+移仓标记 / 1112+目标仓库页 / MoveItemSlot(true) / MoveItemSlot(false) "
+                               + "五种发法游戏都不接受 —— 背包 → 仓库 目前走不通，请改用「收回已布置家具 → 仓库」或手动收纳。");
                     return;
                 }
 
@@ -959,6 +1017,37 @@ public sealed class LKami9HousingHelper : ModuleBase
                 case MoveKind.StoreAsDest:
                     HousingCommand.Store(StoreroomDest(), (uint)slot);
                     break;
+                case MoveKind.StoreByMove:
+                case MoveKind.StoreByMoveNoFlag:
+                {
+                    // 游戏自己的容器搬运函数（DailyRoutines 的「快速存雇员」就是这么搬的）。
+                    // 它返回一个 int 结果码：0 通常表示成功 —— 把这个码打进日志，失败原因就有据可查了。
+                    if (!this.TryFindFreeStoreroomSlot(out var dstContainer, out var dstSlot))
+                    {
+                        this.StopJob("存入失败：房屋仓库里一个空槽都没有（仓库满）—— 先取出一些再存。");
+                        return;
+                    }
+
+                    var invMgr = InventoryManager.Instance();
+                    var rc = -999;
+                    if (invMgr != null)
+                    {
+                        try
+                        {
+                            rc = invMgr->MoveItemSlot(type, (ushort)slot, dstContainer, dstSlot,
+                                                      this.job == MoveKind.StoreByMove);
+                        }
+                        catch (Exception ex)
+                        {
+                            DalamudServices.PluginLog.Information(ex, "[装修助手] MoveItemSlot 抛异常（签名可能过期）");
+                            rc = -1;
+                        }
+                    }
+
+                    DalamudServices.PluginLog.Information(
+                        $"[装修助手] MoveItemSlot({(int)type},{slot} → {(int)dstContainer},{dstSlot}, 末参:{(this.job == MoveKind.StoreByMove)}) 返回 {rc}");
+                    break;
+                }
                 case MoveKind.RetrieveToStore:
                     HousingCommand.Restore(type, (uint)slot, toStoreRoom: true);
                     break;
