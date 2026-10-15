@@ -68,15 +68,38 @@ public sealed class LKami9HousingHelper : ModuleBase
     private (int Container, int Slot) jobCurrent = (-1, -1);
     private int jobCurrentTries;
     private int jobSkipStreak;
-    private int jobStartCount;                             // 开工时源侧还有多少件
+    private int jobStartCount;                             // 开工时源侧容器里的全部件数
+    private int jobStartMatch;                             // 开工时源侧「能搬」的件数
     private int jobSent;
     private int jobSkipped;
-    private string status = "空闲。先识别……不，先站到自己家里，再点下面两个按钮。";
+    private int jobDoneFrames;                             // 连续多少轮「源侧一件都没少」
+    private int jobDoneBaseline;
+    private string status = "空闲。先站到自己家里，再点下面两个按钮。";
 
     private readonly HashSet<(int Container, int Slot)> jobTried = [];
     private HashSet<uint>? furnitureIds;                   // 家具（HousingFurniture）
     private HashSet<uint>? yardIds;                        // 庭具（HousingYardObject）
     private bool frameworkHooked;
+
+    // 上一次现场快照的缓存（诊断用，避免每帧重复读原生结构）
+    private string cachedStatusDetail = "";
+    private DateTime statusDetailAt = DateTime.MinValue;
+
+    /// <summary>一次「数容器 + 生成明细」的结果。</summary>
+    private readonly record struct ContainerCount(int Total, string Detail);
+
+    /// <summary>现场读到的房屋信息（全部来自原生结构，零副作用）。</summary>
+    private readonly record struct HouseInfo(
+        bool OwnTerritory,      // 是否处在「自己家/自己院子/自己部队工坊」区域
+        ulong HouseId,          // 当前区域的房屋 ID（0 = 没在任何房屋区域）
+        string UnitText,        // 房屋类型 / 单元号
+        string PermissionText,  // HasHousePermissions / IsInside / IsOutside 的诊断
+        string Text)            // 给界面显示的一句话
+    {
+        public uint HighId => (uint)(this.HouseId >> 32);
+        public uint LowId  => (uint)this.HouseId;
+        public string Unit => this.UnitText;
+    }
 
     // ══════════════════════════════════════════════════════════
     //  生命周期
@@ -186,27 +209,69 @@ public sealed class LKami9HousingHelper : ModuleBase
     {
         ImGui.TextUnformatted("③ 现场情况");
 
-        var (perms, houseText) = CheckHouse();
-        if (perms) ImGui.TextColored(OmniTheme.Tokens.Success, houseText);
-        else ImGui.TextColored(OmniTheme.Tokens.Warning, houseText);
+        var house = GetHouseInfo();
+        if (house.OwnTerritory) ImGui.TextColored(OmniTheme.Tokens.Success, house.Text);
+        else ImGui.TextColored(OmniTheme.Tokens.Warning, house.Text);
 
         var bagFur = this.CountInContainers(BagContainers, this.furnitureIds);
         var bagYard = this.CountInContainers(BagContainers, this.yardIds);
-        var storeAll = this.CountInContainers(StoreroomContainers, null);
+        var (storeAll, storeDetail) = this.CountWithDetail(StoreroomContainers, null);
         var storeReady = this.AnyContainerLoaded(StoreroomContainers);
 
-        ImGui.TextDisabled(
-            $"背包：家具 {bagFur} 件 / 庭具 {bagYard} 件");
+        ImGui.TextDisabled($"背包：家具 {bagFur} 件 / 庭具 {bagYard} 件");
         if (storeReady)
-            ImGui.TextDisabled($"仓库：共 {storeAll} 件可用");
+        {
+            ImGui.TextDisabled($"仓库：共 {storeAll} 件");
+            ImGui.TextDisabled($"仓库明细：{storeDetail}");
+        }
         else
+        {
             ImGui.TextColored(OmniTheme.Tokens.Warning,
                 "仓库：没读到数据 —— 请先在自己家/院子里打开「家具/庭具仓库」窗口");
+        }
 
         if (this.furnitureIds is { Count: 0 } && this.yardIds is { Count: 0 })
             ImGui.TextColored(OmniTheme.Tokens.Warning, "家具/庭具数据表读取失败（看 /xllog）");
 
+        var detail = this.BuildStatusDiagnostics();
+        ImGui.TextDisabled("诊断：" + detail);
+        if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(this.cachedStatusDetail))
+            ImGui.SetTooltip(this.cachedStatusDetail);
+
         ImGui.TextDisabled("用法：站到自己家（或院子）里 → 打开「家具/庭具仓库」→ 点上面两个按钮。");
+    }
+
+    /// <summary>
+    /// 现场快照（最多每 2 秒重算一次）：把两个前置条件的真实数值摆出来，
+    /// 这样「点了没反应」时一眼能看出卡在哪一条（日志里同样会打一份）。
+    /// </summary>
+    private string BuildStatusDiagnostics()
+    {
+        if (DateTime.UtcNow - this.statusDetailAt > TimeSpan.FromSeconds(2))
+        {
+            this.statusDetailAt = DateTime.UtcNow;
+            this.cachedStatusDetail = this.BuildStatusDetail();
+        }
+        return this.cachedStatusDetail;
+    }
+
+    private string BuildStatusDetail()
+    {
+        var bag = this.CountInContainers(BagContainers, null);
+        var toStore = this.CountInContainers(BagContainers, this.furnitureIds)
+                    + this.CountInContainers(BagContainers, this.yardIds);
+        var (store, storeDetail) = this.CountWithDetail(StoreroomContainers, null);
+        var house = GetHouseInfo();
+
+        return string.Join(" | ",
+            $"家具表 {this.furnitureIds?.Count ?? -1} 种",
+            $"庭具表 {this.yardIds?.Count ?? -1} 种",
+            $"勾选 家具={this.config.IncludeFurniture} 庭具={this.config.IncludeYard}",
+            $"本体容器 2/3={this.CountInContainers(IntermediateContainers, null)}",
+            $"背包 {bag} 件（其中家具/庭具 {toStore} 件）",
+            $"仓库 {store} 件（{storeDetail}）",
+            $"在自家区域={house.OwnTerritory} 房屋ID={house.HighId:X8}:{house.LowId:X8} 单元={house.Unit}",
+            $"权限诊断 {house.PermissionText}");
     }
 
     // ══════════════════════════════════════════════════════════
@@ -230,6 +295,12 @@ public sealed class LKami9HousingHelper : ModuleBase
         InventoryType.HousingInteriorStoreroom7, InventoryType.HousingInteriorStoreroom8,
         InventoryType.HousingInteriorStoreroom9, InventoryType.HousingInteriorStoreroom10,
         InventoryType.HousingInteriorStoreroom11,      // 27001~27011 家具仓库
+    ];
+
+    /// <summary>身上的容器：只为了诊断「背包那一栏到底读没读到」。</summary>
+    private static readonly InventoryType[] IntermediateContainers =
+    [
+        InventoryType.Inventory1, InventoryType.Inventory4,
     ];
 
     /// <summary>建「家具/庭具 道具ID」索引（Lumina 的 HousingFurniture / HousingYardObject 表）。</summary>
@@ -271,24 +342,43 @@ public sealed class LKami9HousingHelper : ModuleBase
     }
 
     private unsafe int CountInContainers(InventoryType[] types, HashSet<uint>? filter)
+        => this.CountWithDetail(types, filter).Total;
+
+    /// <summary>数容器里有多少件（可选道具过滤），同时生成「容器号=件数」明细，供界面/日志定位。</summary>
+    private unsafe (int Total, string Detail) CountWithDetail(InventoryType[] types, HashSet<uint>? filter)
     {
         var mgr = InventoryManager.Instance();
-        if (mgr == null) return 0;
+        if (mgr == null) return (0, "InventoryManager 没读到");
 
         var n = 0;
+        var parts = new List<string>();
         foreach (var type in types)
         {
             var cont = mgr->GetInventoryContainer(type);
-            if (cont == null || !cont->IsLoaded) continue;
+            if (cont == null)
+            {
+                parts.Add($"{(int)type}=无");
+                continue;
+            }
+            if (!cont->IsLoaded)
+            {
+                parts.Add($"{(int)type}=未载入");
+                continue;
+            }
+
+            var here = 0;
             for (var i = 0; i < cont->Size; i++)
             {
                 var slot = cont->GetInventorySlot(i);
                 if (slot == null || slot->ItemId == 0) continue;
                 if (filter != null && !filter.Contains(slot->ItemId)) continue;
-                n++;
+                here++;
             }
+            n += here;
+            parts.Add($"{(int)type}={here}");
         }
-        return n;
+
+        return (n, string.Join(" ", parts));
     }
 
     private unsafe bool AnyContainerLoaded(InventoryType[] types)
@@ -303,23 +393,90 @@ public sealed class LKami9HousingHelper : ModuleBase
         return false;
     }
 
-    /// <summary>是否在自己家（有房屋权限）。</summary>
-    private static unsafe (bool Ok, string Text) CheckHouse()
+    /// <summary>
+    /// 现场房屋信息（纯读原生结构，没有任何会被游戏拒绝的调用）。
+    ///
+    /// 【为什么这样判】游戏侧真正决定「这条搬运指令发不发」的是
+    /// HousingManager 的 IndoorTerritory / OutdoorTerritory / WorkshopTerritory 三个指针
+    /// （三个都为空 = 不在任何房屋区域，指令会被丢弃）；把它们的 HouseId 读出来，
+    /// 就是最可靠的「在不在自己家」判据，而且不依赖任何 AOB 签名。
+    /// HasHousePermissions / IsInside / IsOutside 走的是 MemberFunctionPointers（签名地址），
+    /// 签名过期会抛异常 —— 所以只当诊断信息，不让它挡流程。
+    /// </summary>
+    private static unsafe HouseInfo GetHouseInfo()
     {
         try
         {
             var hm = HousingManager.Instance();
-            if (hm == null) return (false, "房屋：没读到数据");
-            return hm->HasHousePermissions()
-                ? (true, "房屋：有权限 ✓")
-                : (false, "房屋：没有房屋权限 ✗（要先到自己家/院子里，且必须有权限）");
+            if (hm == null) return new HouseInfo(false, 0, "读不到", "HousingManager 没读到", "房屋：没读到数据");
+
+            var indoor = hm->IndoorTerritory;
+            var outdoor = hm->OutdoorTerritory;
+            var workshop = hm->WorkshopTerritory;
+
+            HouseId id = default;
+            var zone = "无";
+            var unitText = "-";
+            if (indoor != null)
+            {
+                id = indoor->HouseId;
+                zone = "室内";
+                unitText = DescribeUnit(id);
+            }
+            else if (outdoor != null)
+            {
+                id = outdoor->HouseId;
+                zone = "院子";
+                unitText = DescribeUnit(id);
+            }
+            else if (workshop != null)
+            {
+                id = workshop->HouseId;
+                zone = "工坊";
+                unitText = "部队工坊";
+            }
+
+            var raw = id.Id;
+            var own = raw != 0;
+            var perms = DescribePermissions(hm);
+            var text = own
+                ? $"房屋：在自家区域（{zone}） {unitText} 房屋ID {id.TerritoryTypeId}区/{id.WardIndex}号/{unitText}"
+                : "房屋：没读到房屋区域 —— 先回自己家/院子里再点（游戏会拒绝搬运）";
+            return new HouseInfo(own, raw, unitText, perms, text);
         }
         catch (Exception ex)
         {
-            DalamudServices.PluginLog.Information(ex, "[装修助手] 读房屋权限失败");
-            return (false, "房屋：读取失败（看 /xllog）");
+            DalamudServices.PluginLog.Information(ex, "[装修助手] 读房屋信息失败");
+            return new HouseInfo(false, 0, "读失败", "读取异常（看 /xllog）", "房屋：读取失败（看 /xllog）");
         }
     }
+
+    private static unsafe string DescribeUnit(HouseId id)
+    {
+        var unit = id.Unit;
+        return unit.IsApartment
+            ? $"公寓 {unit.ApartmentDivision} 号"
+            : $"地块 {unit.PlotIndex} 号";
+    }
+
+    /// <summary>把三个「签名型」成员函数的结果打包成诊断字符串；任何一个抛异常都不会影响主流程。</summary>
+    private static unsafe string DescribePermissions(HousingManager* hm)
+    {
+        var parts = new List<string>(3);
+        parts.Add(TryMember(() => hm->HasHousePermissions() ? "权限=True" : "权限=False"));
+        parts.Add(TryMember(() => hm->IsInside() ? "室内=True" : "室内=False"));
+        parts.Add(TryMember(() => hm->IsOutside() ? "院内=True" : "院内=False"));
+        return string.Join(" ", parts);
+    }
+
+    private static string TryMember(Func<string> probe)
+    {
+        try { return probe(); }
+        catch (Exception ex) { return "读取异常(" + ex.GetType().Name + ")"; }
+    }
+
+    /// <summary>是否在自家区域（见 GetHouseInfo 的说明：按原生房屋指针判，不依赖 AOB 签名）。</summary>
+    private static HouseInfo CheckHouse() => GetHouseInfo();
 
     // ══════════════════════════════════════════════════════════
     //  搬运流程
@@ -327,22 +484,64 @@ public sealed class LKami9HousingHelper : ModuleBase
 
     private void StartJob(MoveKind kind)
     {
+        var what = kind == MoveKind.Store ? "存入" : "取出";
+
+        // ① 建索引（失败也照样往下走，日志里能看到数量）
         this.LoadFurnitureIndexIfNeeded();
-        if (this.furnitureIds is { Count: 0 } && this.yardIds is { Count: 0 })
+        var idxFur = this.furnitureIds?.Count ?? -1;
+        var idxYard = this.yardIds?.Count ?? -1;
+        // 这三个结果一定要打日志 —— 之前守卫失败是静默的，害得排查全靠猜
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 前置①索引：家具 {idxFur} 种 / 庭具 {idxYard} 种");
+
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 前置②范围：家具={this.config.IncludeFurniture} 庭具={this.config.IncludeYard} 间隔={this.config.IntervalMs}ms");
+
+        var house = GetHouseInfo();
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 前置③房屋：在自家区域={house.OwnTerritory} 房屋ID={house.HighId:X8}:{house.LowId:X8} 单元={house.Unit} {house.PermissionText}");
+
+        var srcTypes = kind == MoveKind.Store ? BagContainers : StoreroomContainers;
+        var (srcAll, srcDetail) = this.CountWithDetail(srcTypes, null);
+        var srcMatch = kind == MoveKind.Store
+            ? this.CountInContainers(BagContainers, this.furnitureIds) + this.CountInContainers(BagContainers, this.yardIds)
+            : srcAll;
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 前置④容器：{(kind == MoveKind.Store ? "背包" : "仓库")} {srcAll} 件（其中要搬 {srcMatch} 件）明细 {srcDetail}");
+
+        // 守卫 1：索引空
+        if (idxFur <= 0 && idxYard <= 0)
         {
+            DalamudServices.PluginLog.Information("[装修助手] 中止：家具/庭具数据表为空");
             this.status = "家具/庭具数据表没读到，先别搬。";
             return;
         }
+
+        // 守卫 2：范围全没勾
         if (!this.config.IncludeFurniture && !this.config.IncludeYard)
         {
+            DalamudServices.PluginLog.Information("[装修助手] 中止：家具/庭具两个都没勾");
             this.status = "「家具」「庭具」两个都没勾，没得搬。";
             return;
         }
 
-        var (perms, _) = CheckHouse();
-        if (!perms)
+        // 守卫 3：不在自家区域
+        // （判据 = 原生房屋指针有值。这里放行后即使真的没权限，游戏也只是不收指令，
+        //   由下面的「连续 3 次搬不动 → 跳过 / 连 10 件 → 停」兜住，不会静默卡死。）
+        if (!house.OwnTerritory)
         {
-            this.status = "看起来不在自己家（没有房屋权限）—— 游戏会拒绝搬运，先回自己家/院子再点。";
+            DalamudServices.PluginLog.Information("[装修助手] 中止：不在自家房屋区域（房屋ID 为 0）");
+            this.status = "看起来不在自己家/院子里 —— 先回去再点。";
+            return;
+        }
+
+        // 守卫 4：源侧根本没有要搬的东西
+        if (srcMatch <= 0)
+        {
+            DalamudServices.PluginLog.Information($"[装修助手] 中止：{(kind == MoveKind.Store ? "背包" : "仓库")}里没有要搬的家具/庭具（0 件）");
+            this.status = kind == MoveKind.Store
+                ? "背包里没找到家具/庭具（或没勾对应的范围）。"
+                : "仓库里没读到家具/庭具 —— 先打开「家具/庭具仓库」窗口。";
             return;
         }
 
@@ -355,15 +554,16 @@ public sealed class LKami9HousingHelper : ModuleBase
         this.jobSkipped = 0;
         this.jobTried.Clear();
 
-        var srcTypes = kind == MoveKind.Store ? BagContainers : StoreroomContainers;
-        this.jobStartCount = kind == MoveKind.Store
-            ? this.CountInContainers(srcTypes, null)      // 背包里的全部（含非家具，仅用于显示）
-            : this.CountInContainers(srcTypes, null);
+        this.jobStartCount = srcAll;
+        this.jobStartMatch = srcMatch;
+        this.jobDoneFrames = 0;
+        this.jobDoneBaseline = srcAll;
 
         this.status = kind == MoveKind.Store
-            ? $"开始存入：源侧共 {this.jobStartCount} 件（会跳过不是家具/庭具的东西）…"
-            : $"开始取出：仓库里共 {this.jobStartCount} 件…";
-        DalamudServices.PluginLog.Information($"[装修助手] 开始 {(kind == MoveKind.Store ? "存入" : "取出")}，源侧 {this.jobStartCount} 件");
+            ? $"开始存入：共 {srcMatch} 件家具/庭具…"
+            : $"开始取出：仓库里共 {srcMatch} 件…";
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 开始{what}：源侧 {srcAll} 件（要搬 {srcMatch} 件），每件间隔 {this.jobIntervalFrames} 帧");
     }
 
     private void StopJob(string why)
@@ -373,14 +573,15 @@ public sealed class LKami9HousingHelper : ModuleBase
         this.jobCurrent = (-1, -1);
 
         var srcTypes = kind == MoveKind.Store ? BagContainers : StoreroomContainers;
-        var left = this.CountInContainers(srcTypes, null);
+        var (left, leftDetail) = this.CountWithDetail(srcTypes, null);
         var moved = Math.Max(0, this.jobStartCount - left);
 
         this.status = $"{why} 已搬 {moved} 件" +
                       (this.jobSkipped > 0 ? $"，跳过 {this.jobSkipped} 件（游戏没收）" : "") +
                       $"，源侧还剩 {left} 件。";
         DalamudServices.PluginLog.Information(
-            $"[装修助手] {why} 搬了 {moved} 件，跳过 {this.jobSkipped}，源侧剩 {left}");
+            $"[装修助手] {why} 已搬 {moved} 件，共发 {this.jobSent} 次指令，跳过 {this.jobSkipped}，" +
+            $"源侧 {this.jobStartCount}→{left} 件（其中要搬 {this.jobStartMatch} 件）明细 {leftDetail}");
     }
 
     private unsafe void OnFrameworkTick(Dalamud.Plugin.Services.IFramework framework)
@@ -392,9 +593,26 @@ public sealed class LKami9HousingHelper : ModuleBase
             if (++this.jobWait < this.jobIntervalFrames) return;
             this.jobWait = 0;
 
+            // 源侧一直没变少（游戏压根没收指令）→ 等够 8 轮就停，不然会发几千条无效指令
+            var loopDetail = "";
+            if (this.job != MoveKind.None && this.jobSent > 0)
+            {
+                var srcTypes = this.job == MoveKind.Store ? BagContainers : StoreroomContainers;
+                var now = this.CountInContainers(srcTypes, null);
+                if (now < this.jobDoneBaseline)
+                {
+                    this.jobDoneBaseline = now;
+                    this.jobDoneFrames = 0;
+                }
+                else if (++this.jobDoneFrames >= 8)
+                {
+                    loopDetail = "（源侧一件都没少：指令可能被游戏拒了 —— 仓库满 / 没打开仓库窗口 / 不是自己的房子）";
+                }
+            }
+
             if (!this.TryFindNext(out var container, out var slot, out var itemId))
             {
-                this.StopJob("搬完了。");
+                this.StopJob(string.IsNullOrEmpty(loopDetail) ? "搬完了。" : "停手了。" + loopDetail);
                 return;
             }
 
@@ -416,10 +634,18 @@ public sealed class LKami9HousingHelper : ModuleBase
                 this.jobSkipStreak++;
 
                 if (this.jobSkipStreak >= 10)
-                    this.StopJob("连续 10 件都搬不动 —— 可能是仓库已满 / 没打开仓库窗口 / 权限不足。");
+                {
+                    this.StopJob("连续 10 件都搬不动 —— 可能是仓库已满 / 没打开仓库窗口 / 不在自己家。" + loopDetail);
+                    return;
+                }
+
+                if (!string.IsNullOrEmpty(loopDetail))
+                {
+                    this.StopJob(loopDetail);
+                    return;
+                }
                 return;
             }
-
             var type = (InventoryType)container;
             if (this.job == MoveKind.Store)
                 HousingCommand.Store(type, (uint)slot);
@@ -463,8 +689,9 @@ public sealed class LKami9HousingHelper : ModuleBase
                 if (s == null || s->ItemId == 0) continue;
                 if (this.jobTried.Contains(((int)type, i))) continue;
 
-                // 存入时只挑家具/庭具；取出时仓库里都是家具/庭具，不用筛
-                if (this.job == MoveKind.Store && !this.MatchesFilter(s->ItemId)) continue;
+                // 两边都按勾选的范围筛：存入时筛背包，取出时筛仓库
+                // （仓库里只可能有家具/庭具，多筛一次不影响结果，但能防住「仓库页里混进别的东西」）
+                if (!this.MatchesFilter(s->ItemId)) continue;
 
                 container = (int)type;
                 slot = i;
