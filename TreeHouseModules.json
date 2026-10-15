@@ -1,0 +1,15 @@
+{
+  "SchemaVersion": 1,
+  "Modules": [
+    {
+      "InternalName": "LKami9HousingHelper",
+      "Name": "LKami9装修助手",
+      "Author": "LKami9",
+      "Description": "批量搬家具：把背包里的家具/庭具一次存进房屋仓库，或把仓库里的家具/庭具批量取回背包。需要在自己家/院子里，建议先打开「家具/庭具仓库」窗口。",
+      "Version": "1.0.0",
+      "MinimumOmniVersion": "1.1.7.0",
+      "File": "Modules/LKami9HousingHelper.cs",
+      "Sha256": "EF9FE7C697353CBCB9DD8D04AD6AD8B506987C447C82801A156A0CF29E7E9EF8"
+    }
+  ]
+}
