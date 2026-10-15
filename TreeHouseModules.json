@@ -5,11 +5,11 @@
       "InternalName": "LKami9HousingHelper",
       "Name": "LKami9装修助手",
       "Author": "LKami9",
-      "Description": "批量搬家具：仓库 → 背包、屋里/院里已摆放的 → 背包/仓库（实测可用）；另含实验功能「两步存入」（背包家具先布置到屋里再收回仓库）。需要在自己家/院子里，并打开家具界面。",
-      "Version": "1.4.0",
+      "Description": "批量搬家具：仓库 → 背包、屋里/院里已摆放的 → 背包/仓库（实测可用）。另带「家具清单」面板：列出背包里的家具/庭具与所在格子，方便对着手动收纳，存进仓库后自动划掉。",
+      "Version": "1.5.0",
       "MinimumOmniVersion": "1.1.7.0",
       "File": "Modules/LKami9HousingHelper.cs",
-      "Sha256": "431C7CCFB0B602663B9A049352B65ADF730B72C11B080AE58912874A8C05CF91"
+      "Sha256": "420883AF8C0E5CB56EE6AA0FA0271BFC889FDBBD0FE44C54A4DEA8DD1A99F9F4"
     }
   ]
 }

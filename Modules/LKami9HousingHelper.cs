@@ -11,6 +11,7 @@ using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI;
 
 using Lumina.Excel.Sheets;
+using Lumina.Text.ReadOnly;
 
 using OmenTools.Interop.Game.ExecuteCommand.Implementations;
 
@@ -63,35 +64,24 @@ public sealed class LKami9HousingHelper : ModuleBase
         Author      = "LKami9",
         Commands    =
         [
-            new("批量存入（背包 → 仓库）", "/omni LKami9HousingHelper store"),
             new("批量取出（仓库 → 背包）", "/omni LKami9HousingHelper take"),
             new("收回已布置家具 → 背包", "/omni LKami9HousingHelper pick"),
             new("收回已布置家具 → 仓库", "/omni LKami9HousingHelper pack"),
-            new("实验·两步存入（背包 → 布置 → 仓库）", "/omni LKami9HousingHelper place-store"),
         ],
     };
 
     public override bool HasSettings => true;
 
     /// <summary>代码版本（只用于日志：一眼看出游戏里编的是哪一版）。</summary>
-    private const string ModuleVersion = "1.4.0";
+    private const string ModuleVersion = "1.5.0";
 
     // 宿主按「以 Config 结尾的成员」绑定已保存的配置；不能是 readonly
     private LKami9HousingHelperConfig config = new();
 
     // ── 搬运状态 ──
-    private enum MoveKind { None, Store, StoreAsStore, StoreAsDest, PlaceThenStore, TakeOut, RetrieveToBag, RetrieveToStore }
+    private enum MoveKind { None, TakeOut, RetrieveToBag, RetrieveToStore }
 
     private MoveKind job = MoveKind.None;
-    private int storeLadderStep;                           // 「存入」当前在第几种发法
-    private int storeLadderPass;                           // 「存入」整套发法跑到第几轮
-
-    // ── 「两步存入」（实验）：背包 → 布置到屋里 → 收回仓库 ──
-    private readonly HashSet<(int Container, int Slot)> placedBefore = [];   // 开工前就摆着的（绝不碰）
-    private (int Container, int Slot) placePending = (-1, -1);               // 正在布置的背包位
-    private int placeWait;                                                   // 布置后等了多少帧
-    private int placeFailStreak;                                             // 连续几次布置没生效
-    private int placeDone;                                                   // 已经成功收回仓库的件数
     private int jobWait;                                   // 距上一件过了几帧
     private int jobIntervalFrames = 19;                    // 每件之间隔多少帧（≈300ms）
     private (int Container, int Slot) jobCurrent = (-1, -1);
@@ -174,10 +164,6 @@ public sealed class LKami9HousingHelper : ModuleBase
     {
         switch ((arguments ?? "").Trim().ToLowerInvariant())
         {
-            case "store":
-            case "存入":
-                this.StartJob(MoveKind.Store);
-                return true;
             case "take":
             case "取出":
                 this.StartJob(MoveKind.TakeOut);
@@ -189,10 +175,6 @@ public sealed class LKami9HousingHelper : ModuleBase
             case "pack":
             case "收回仓库":
                 this.StartJob(MoveKind.RetrieveToStore);
-                return true;
-            case "place-store":
-            case "两步存入":
-                this.StartJob(MoveKind.PlaceThenStore);
                 return true;
             default:
                 return false;
@@ -230,9 +212,6 @@ public sealed class LKami9HousingHelper : ModuleBase
         var busy = this.job != MoveKind.None;
         using (ImRaii.Disabled(busy))
         {
-            if (ImGui.Button("批量存入（背包 → 仓库）")) this.StartJob(MoveKind.Store);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("游戏没有对外暴露「背包 → 仓库」接口，实测无效；请手动收纳，或用「收回已布置家具 → 仓库」");
-            ImGui.SameLine();
             if (ImGui.Button("批量取出（仓库 → 背包）")) this.StartJob(MoveKind.TakeOut);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("房屋仓库里的 家具/庭具 全部取回背包");
 
@@ -241,9 +220,6 @@ public sealed class LKami9HousingHelper : ModuleBase
             ImGui.SameLine();
             if (ImGui.Button("收回已布置家具 → 仓库")) this.StartJob(MoveKind.RetrieveToStore);
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("把屋里/院里已经摆放的 家具/庭具 全部收回房屋仓库（源：25001 / 25003~25014）");
-
-            if (ImGui.Button("实验：两步存入（背包 → 布置 → 仓库）")) this.StartJob(MoveKind.PlaceThenStore);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("先把背包里每件家具 Place 布置到屋里，再立刻 Restore 收回仓库。布置位置由游戏决定，家具会短暂出现在屋里；开工前就摆着的家具不会被碰。失败会明确报出来。");
         }
 
         ImGui.SameLine();
@@ -257,8 +233,167 @@ public sealed class LKami9HousingHelper : ModuleBase
 
         ImGui.Separator();
         this.DrawStatusSection();
+        this.DrawBagFurniturePanel();
 
         return false;
+    }
+
+    // ══════════════════════════════════════════════════════════
+    //  ④ 家具清单（只列背包里的 家具/庭具，一行一件，方便对着手动收纳）
+    // ══════════════════════════════════════════════════════════
+
+    /// <summary>清单里的一件（背包位置 + 道具 + 是否已经进仓库）。</summary>
+    private sealed class BagFurnitureEntry
+    {
+        public int Container;
+        public int Slot;
+        public uint ItemId;
+        public bool Done;
+    }
+
+    private readonly List<BagFurnitureEntry> bagPanel = [];
+    private DateTime bagPanelAt = DateTime.MinValue;
+    private readonly Dictionary<uint, string> bagPanelNames = [];
+
+    /// <summary>刷新清单：补上背包里新出现的家具、把「背包里没了 + 仓库里有」的标成已完成。</summary>
+    private unsafe void RefreshBagPanel(bool force)
+    {
+        if (!force && DateTime.UtcNow - this.bagPanelAt < TimeSpan.FromMilliseconds(700)) return;
+        this.bagPanelAt = DateTime.UtcNow;
+
+        var mgr = InventoryManager.Instance();
+        if (mgr == null) return;
+
+        // 仓库里各道具的数量（用来确认「真的进仓库了」）
+        var inStore = new Dictionary<uint, int>();
+        foreach (var type in StoreroomContainers)
+        {
+            var cont = mgr->GetInventoryContainer(type);
+            if (cont == null || !cont->IsLoaded) continue;
+            for (var i = 0; i < cont->Size; i++)
+            {
+                var s = cont->GetInventorySlot(i);
+                if (s == null || s->ItemId == 0) continue;
+                inStore.TryGetValue(s->ItemId, out var n);
+                inStore[s->ItemId] = n + 1;
+            }
+        }
+
+        // 已有的条目：背包那格空了 + 仓库里有同名道具 → 完成
+        foreach (var e in this.bagPanel)
+        {
+            if (e.Done) continue;
+            if (this.SlotItemId(e.Container, e.Slot) == e.ItemId) continue;
+            if (inStore.TryGetValue(e.ItemId, out var n) && n > 0) e.Done = true;
+        }
+
+        // 背包里现在还有的家具/庭具 → 补进清单
+        foreach (var type in BagContainers)
+        {
+            var cont = mgr->GetInventoryContainer(type);
+            if (cont == null || !cont->IsLoaded) continue;
+            for (var i = 0; i < cont->Size; i++)
+            {
+                var s = cont->GetInventorySlot(i);
+                if (s == null || s->ItemId == 0) continue;
+                if (!this.MatchesFilter(s->ItemId)) continue;
+                if (this.bagPanel.Exists(e => e.Container == (int)type && e.Slot == i && e.ItemId == s->ItemId && !e.Done))
+                    continue;
+
+                this.bagPanel.Add(new BagFurnitureEntry
+                {
+                    Container = (int)type,
+                    Slot = i,
+                    ItemId = s->ItemId,
+                });
+            }
+        }
+
+        // 已完成的排到后面，列表更好读
+        this.bagPanel.Sort((a, b) => a.Done.CompareTo(b.Done));
+    }
+
+    /// <summary>道具名（读不到就退回「道具 ID」）。</summary>
+    private string BagPanelItemName(uint itemId)
+    {
+        if (this.bagPanelNames.TryGetValue(itemId, out var cached)) return cached;
+
+        var name = $"道具 {itemId}";
+        try
+        {
+            var row = DalamudServices.DataManager.GetExcelSheet<Item>().GetRow(itemId);
+            var text = row.Name.ExtractText();
+            if (!string.IsNullOrWhiteSpace(text)) name = text;
+        }
+        catch { }
+
+        this.bagPanelNames[itemId] = name;
+        return name;
+    }
+
+    private void DrawBagFurniturePanel()
+    {
+        ImGui.Separator();
+        ImGui.TextUnformatted("④ 家具清单（背包里的 家具/庭具）");
+
+        this.RefreshBagPanel(false);
+
+        var pending = this.bagPanel.FindAll(e => !e.Done);
+        var done = this.bagPanel.Count - pending.Count;
+
+        ImGui.TextDisabled($"共 {this.bagPanel.Count} 件：待存 {pending.Count} 件 / 已进仓库 {done} 件");
+        if (ImGui.SmallButton("刷新清单")) this.RefreshBagPanel(true);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("清空清单")) this.bagPanel.Clear();
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip("只清掉这个列表的显示，不会动任何道具");
+
+        ImGui.TextDisabled("用法：复制下面的「背包位置」，在家具界面里对着收纳；存进仓库后这里会自动划掉。");
+
+        if (this.bagPanel.Count == 0)
+        {
+            ImGui.TextDisabled("（背包里没读到 家具/庭具 —— 站到自己家/院子里再看一次）");
+            return;
+        }
+
+        var shown = 0;
+        for (var i = 0; i < this.bagPanel.Count; i++)
+        {
+            var e = this.bagPanel[i];
+            var label = $"{this.BagPanelItemName(e.ItemId)}　背包 {e.Container + 1} 第 {e.Slot + 1} 格";
+
+            if (e.Done)
+            {
+                ImGui.TextDisabled(label + "　已完成");
+                continue;
+            }
+
+            ImGui.TextUnformatted(label);
+            ImGui.SameLine();
+            if (ImGui.SmallButton($"试一下##try{i}")) this.TryStoreFromPanel(e);
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("游戏没有对外暴露「背包 → 仓库」接口，这一下多半无效；无效就请在家具界面里手动收纳（清单会自动划掉已完成的）。");
+
+            if (++shown >= 40)
+            {
+                ImGui.TextDisabled($"…还有 {pending.Count - shown} 件待存（列表太长就不全画了）");
+                break;
+            }
+        }
+    }
+
+    /// <summary>清单里「试一下」：把已知的存放指令发一遍，之后由清单刷新核对是否真的进仓库了。</summary>
+    private void TryStoreFromPanel(BagFurnitureEntry e)
+    {
+        var house = GetHouseInfo();
+        HousingCommand.Store((InventoryType)e.Container, (uint)e.Slot);
+        HousingCommand.Restore((InventoryType)e.Container, (uint)e.Slot, toStoreRoom: true);
+        HousingCommand.RequestPlacedFurnitures(isIndoor: true);
+        HousingCommand.RequestStoreroomStatus(house.HighId, house.LowId);
+
+        DalamudServices.PluginLog.Information(
+            $"[装修助手] 清单「试一下」：道具 {e.ItemId} 背包 {e.Container},{e.Slot} —— 已发 1112 / 1113+移仓标记 / 1121 / 1151；"
+            + "若清单没变成已完成，说明这条方向游戏不接受，请手动收纳");
+        this.status = "已试过存放指令（多半无效）—— 若清单没划掉，请在家具界面手动收纳。";
     }
 
     private void DrawStatusSection()
@@ -380,8 +515,6 @@ public sealed class LKami9HousingHelper : ModuleBase
     /// <summary>这个动作的「源侧容器」是哪一批。</summary>
     private static InventoryType[] SourceContainers(MoveKind kind) => kind switch
     {
-        MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest
-            or MoveKind.PlaceThenStore => BagContainers,
         MoveKind.RetrieveToBag or MoveKind.RetrieveToStore => PlacedContainers,
         _ => StoreroomContainers,
     };
@@ -389,8 +522,6 @@ public sealed class LKami9HousingHelper : ModuleBase
     /// <summary>源侧的名字（日志/界面用）。</summary>
     private static string SourceNoun(MoveKind kind) => kind switch
     {
-        MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest
-            or MoveKind.PlaceThenStore => "背包",
         MoveKind.RetrieveToBag or MoveKind.RetrieveToStore => "已布置",
         _ => "仓库",
     };
@@ -398,8 +529,6 @@ public sealed class LKami9HousingHelper : ModuleBase
     /// <summary>动作名（日志/界面用）。</summary>
     private static string ActionName(MoveKind kind) => kind switch
     {
-        MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest => "存入（背包 → 仓库）",
-        MoveKind.PlaceThenStore => "两步存入（背包 → 布置 → 仓库）",
         MoveKind.RetrieveToBag => "收回已布置 → 背包",
         MoveKind.RetrieveToStore => "收回已布置 → 仓库",
         _ => "取出（仓库 → 背包）",
@@ -411,15 +540,6 @@ public sealed class LKami9HousingHelper : ModuleBase
     /// 所以「源侧变少」不足以下结论，必须同时看目标容器有没有真的多出来。
     /// </summary>
     private unsafe string StoreroomDetail() => this.CountWithDetail(StoreroomContainers, null).Detail;
-
-    /// <summary>存入失败换招时用：把「仓库页」当第 3 参传的目标容器（室内 27001 / 站在院里时 27000）。</summary>
-    private static unsafe InventoryType StoreroomDest()
-    {
-        var hm = HousingManager.Instance();
-        if (hm != null && hm->OutdoorTerritory != null && hm->IndoorTerritory == null)
-            return InventoryType.HousingExteriorStoreroom;
-        return InventoryType.HousingInteriorStoreroom1;
-    }
 
     /// <summary>身上的容器：只为了诊断「背包那一栏到底读没读到」。</summary>
     private static readonly InventoryType[] IntermediateContainers =
@@ -608,18 +728,8 @@ public sealed class LKami9HousingHelper : ModuleBase
 
     private void StartJob(MoveKind kind)
     {
-        // 「存入」从「实测有效的那种发法」开始；后面一件都没搬动就按 StoreLadder 依次换招。
-        if (IsStoreKind(kind))
-        {
-            this.storeLadderStep = 0;
-            this.storeLadderPass = 0;
-            kind = StoreLadder[0];
-        }
-
         var what = ActionName(kind);
         DalamudServices.PluginLog.Information($"[装修助手] ===== 开始{what}（代码版本 v{ModuleVersion}）=====");
-        if (IsStoreKind(kind))
-            DalamudServices.PluginLog.Information($"[装修助手] 存入发法：{StoreMethodName(kind)}");
 
         // ① 建索引（失败也照样往下走，日志里能看到数量）
         this.LoadFurnitureIndexIfNeeded();
@@ -638,9 +748,7 @@ public sealed class LKami9HousingHelper : ModuleBase
 
         var srcTypes = SourceContainers(kind);
         var (srcAll, srcDetail) = this.CountWithDetail(srcTypes, null);
-        var srcMatch = kind is MoveKind.Store or MoveKind.StoreAsStore or MoveKind.PlaceThenStore
-            ? this.CountInContainers(BagContainers, this.furnitureIds) + this.CountInContainers(BagContainers, this.yardIds)
-            : srcAll;
+        var srcMatch = srcAll;
         DalamudServices.PluginLog.Information(
             $"[装修助手] 前置④容器：{SourceNoun(kind)} {srcAll} 件（其中要搬 {srcMatch} 件）明细 {srcDetail}");
 
@@ -674,9 +782,7 @@ public sealed class LKami9HousingHelper : ModuleBase
         if (srcMatch <= 0)
         {
             DalamudServices.PluginLog.Information($"[装修助手] 中止：{SourceNoun(kind)}里没有要搬的家具/庭具（0 件）");
-            this.status = kind is MoveKind.Store or MoveKind.StoreAsStore or MoveKind.PlaceThenStore
-                ? "背包里没找到家具/庭具（或没勾对应的范围）。"
-                : $"没读到要搬的东西（{SourceNoun(kind)}）—— 盖上家具界面（家具/庭具窗口）再点一次。";
+            this.status = $"没读到要搬的东西（{SourceNoun(kind)}）—— 先在自己家（或院子里）打开家具界面（家具/庭具窗口）再点一次。";
             return;
         }
 
@@ -696,30 +802,13 @@ public sealed class LKami9HousingHelper : ModuleBase
         this.jobSrcRefresh = 0;
         this.jobTried.Clear();
 
-        // 「两步存入」：先把开工前就摆在屋里/院里的家具记下来（这些绝不碰），
-        // 之后只收回「本次布置出来的」那几件。
-        if (kind == MoveKind.PlaceThenStore)
-        {
-            this.placedBefore.Clear();
-            this.SnapshotPlaced();
-            this.placePending = (-1, -1);
-            this.placeWait = 0;
-            this.placeFailStreak = 0;
-            this.placeDone = 0;
-            DalamudServices.PluginLog.Information(
-                $"[装修助手] 两步存入：开工前屋里/院里已有 {this.placedBefore.Count} 件（不会动它们）；"
-                + "接下来对每件背包家具：先 Place 布置到屋里，再 Restore(toStoreRoom) 收回仓库");
-            DalamudServices.PluginLog.Information(
-                "[装修助手] 提示：布置位置由游戏决定，家具会短暂出现在屋里；点「停止」可随时中断。");
-        }
-
         this.jobStartCount = srcAll;
         this.jobStartMatch = srcMatch;
         this.jobSrcNow = srcAll;
         this.jobDoneFrames = 0;
         this.jobDoneBaseline = srcAll;
 
-        if (storeReady || placedReady || kind is MoveKind.Store or MoveKind.StoreAsStore or MoveKind.PlaceThenStore)
+        if (storeReady || placedReady)
         {
             // 源侧数据已经在手里（背包天然可读）→ 直接开工
             this.prepPhase = 3;
@@ -875,49 +964,13 @@ public sealed class LKami9HousingHelper : ModuleBase
             $"[装修助手] 开始{ActionName(this.job)}：源侧 {again} 件（要搬 {this.jobStartMatch} 件），每件间隔 {this.jobIntervalFrames} 帧");
     }
 
-    /// <summary>是不是「存入」这一族（背包 → 仓库）。</summary>
-    private static bool IsStoreKind(MoveKind kind) =>
-        kind is MoveKind.Store or MoveKind.StoreAsStore or MoveKind.StoreAsDest;
 
-    /// <summary>「存入」的 3 种发法（都是 ExecuteCommandFlag 那一族；目前实测**都不生效**）。</summary>
-    private static readonly MoveKind[] StoreLadder =
-    [
-        MoveKind.Store,               // 指令 1112 StoreFurniture(背包, 槽)
-        MoveKind.StoreAsStore,        // 指令 1113 RestoreFurniture(背包, 槽 + 0x10000)
-        MoveKind.StoreAsDest,         // 指令 1112（第 3 参当目标仓库页）
-    ];
 
-    /// <summary>发法的名字（日志里用，能一眼看出这条日志是哪一招）。</summary>
-    private static string StoreMethodName(MoveKind kind) => kind switch
-    {
-        MoveKind.Store => "指令 1112 StoreFurniture",
-        MoveKind.StoreAsStore => "指令 1113 RestoreFurniture+移仓标记",
-        MoveKind.StoreAsDest => "指令 1112（第 3 参当目标仓库页）",
-        _ => kind.ToString(),
-    };
 
     // ══════════════════════════════════════════════════════════
     //  「两步存入」（实验）：背包家具 → Place 布置到屋里 → Restore 收回仓库
     // ══════════════════════════════════════════════════════════
 
-    /// <summary>把开工前屋里/院里已摆放的位置记下来 —— 这些绝不碰。</summary>
-    private unsafe void SnapshotPlaced()
-    {
-        var mgr = InventoryManager.Instance();
-        if (mgr == null) return;
-
-        foreach (var type in PlacedContainers)
-        {
-            var cont = mgr->GetInventoryContainer(type);
-            if (cont == null || !cont->IsLoaded) continue;
-            for (var i = 0; i < cont->Size; i++)
-            {
-                var s = cont->GetInventorySlot(i);
-                if (s == null || s->ItemId == 0) continue;
-                this.placedBefore.Add(((int)type, i));
-            }
-        }
-    }
 
     /// <summary>某个容器的某个槽现在装着什么（0 = 空了 / 读不到）。</summary>
     private unsafe uint SlotItemId(int container, int slot)
@@ -933,151 +986,9 @@ public sealed class LKami9HousingHelper : ModuleBase
         return s == null ? 0 : s->ItemId;
     }
 
-    /// <summary>找一件「本次布置出来的、还没收回」的家具。</summary>
-    private unsafe bool TryFindOurPlaced(out int container, out int slot, out uint itemId)
-    {
-        container = -1;
-        slot = -1;
-        itemId = 0;
 
-        var mgr = InventoryManager.Instance();
-        if (mgr == null) return false;
 
-        foreach (var type in PlacedContainers)
-        {
-            var cont = mgr->GetInventoryContainer(type);
-            if (cont == null || !cont->IsLoaded) continue;
-            for (var i = 0; i < cont->Size; i++)
-            {
-                var s = cont->GetInventorySlot(i);
-                if (s == null || s->ItemId == 0) continue;
-                if (this.placedBefore.Contains(((int)type, i))) continue;   // 本来就在那儿的，别动
-                if (this.jobTried.Contains(((int)type, i))) continue;       // 已经发过收回的，别重复
 
-                container = (int)type;
-                slot = i;
-                itemId = s->ItemId;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// <summary>找下一件要布置的背包家具。</summary>
-    private unsafe bool TryFindNextBagFurniture(out int container, out int slot, out uint itemId)
-    {
-        container = -1;
-        slot = -1;
-        itemId = 0;
-
-        var mgr = InventoryManager.Instance();
-        if (mgr == null) return false;
-
-        foreach (var type in BagContainers)
-        {
-            var cont = mgr->GetInventoryContainer(type);
-            if (cont == null || !cont->IsLoaded) continue;
-            for (var i = 0; i < cont->Size; i++)
-            {
-                var s = cont->GetInventorySlot(i);
-                if (s == null || s->ItemId == 0) continue;
-                if (this.jobTried.Contains(((int)type, i))) continue;
-                if (!this.MatchesFilter(s->ItemId)) continue;
-
-                container = (int)type;
-                slot = i;
-                itemId = s->ItemId;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// 「两步存入」逐帧推进（同一帧只发一条指令）：
-    ///   ① 刚 Place 过 → 等约 1 秒看背包那格空没空（判断布置到底生没生效）
-    ///   ② 有「本次布置出去、还没收回」的 → Restore(toStoreRoom:true) 收回仓库（这条实测有效）
-    ///   ③ 否则找下一件背包家具 → Place
-    ///   ④ 背包没家具了 → 收尾
-    /// </summary>
-    private unsafe void PlaceThenStoreTick()
-    {
-        if (this.placePending.Container >= 0)
-        {
-            if (this.placeWait++ < 60) return;
-
-            var (bagType, bagSlot) = this.placePending;
-            this.placePending = (-1, -1);
-            var left = this.SlotItemId(bagType, bagSlot);
-            DalamudServices.PluginLog.Information(
-                $"[装修助手] 布置结果：背包 {bagType},{bagSlot} "
-                + (left == 0 ? "已空（布置生效）" : $"还在（道具 {left}，布置没生效）"));
-
-            if (left != 0)
-            {
-                this.placeFailStreak++;
-                if (this.placeFailStreak >= 3)
-                {
-                    this.StopJob("两步存入失败：Place（布置）连续 3 次没生效 —— 游戏也不允许程序布置家具。");
-                }
-            }
-            else
-            {
-                this.placeFailStreak = 0;
-            }
-            return;
-        }
-
-        if (this.TryFindOurPlaced(out var pc, out var ps, out var pItem))
-        {
-            HousingCommand.Restore((InventoryType)pc, (uint)ps, toStoreRoom: true);
-            this.jobSent++;
-            this.placeDone++;
-            this.jobTried.Add((pc, ps));
-            DalamudServices.PluginLog.Information(
-                $"[装修助手] 第 {this.placeDone} 件：收回布置 → 仓库（容器 {pc} 槽 {ps} 道具 {pItem}）");
-            this.status = $"两步存入中… 已收回 {this.placeDone} 件";
-            return;
-        }
-
-        if (this.TryFindNextBagFurniture(out var bc, out var bs, out var bItem))
-        {
-            HousingCommand.Place((InventoryType)bc, (uint)bs);
-            this.placePending = (bc, bs);
-            this.placeWait = 0;
-            DalamudServices.PluginLog.Information($"[装修助手] 布置：背包 {bc},{bs} 道具 {bItem}（Place / PlaceFurnish 1150）");
-            this.status = $"两步存入中… 正在布置第 {this.placeDone + 1} 件";
-            return;
-        }
-
-        var (placedNow, placedDetail) = this.CountWithDetail(PlacedContainers, null);
-        DalamudServices.PluginLog.Information(
-            $"[装修助手] 两步存入收尾：屋里/院里现在 {placedNow} 件（{placedDetail}），仓库 {this.StoreroomDetail()}");
-        this.StopJob("两步存入完成。");
-    }
-
-    /// <summary>「存入」换招：清空重试状态并把同一批从头试一遍（含重新请求仓库上下文）。</summary>
-    private void SwitchStoreVariant(MoveKind next, string log)
-    {
-        this.job = next;
-        this.jobTried.Clear();
-        this.jobCurrent = (-1, -1);
-        this.jobCurrentTries = 0;
-        this.jobSkipStreak = 0;
-        this.jobSent = 0;
-        this.jobDoneFrames = 0;
-        this.jobDoneBaseline = this.CountInContainers(BagContainers, null);
-
-        // 换招前把仓库上下文再请求一次（这两条指令只影响游戏侧的 UI 数据，不搬东西）
-        var house = GetHouseInfo();
-        HousingCommand.RequestPlacedFurnitures(isIndoor: true);
-        HousingCommand.RequestStoreroomStatus(house.HighId, house.LowId);
-
-        DalamudServices.PluginLog.Information("[装修助手] " + log);
-        this.status = log + "…";
-        if (IsStoreKind(next))
-            DalamudServices.PluginLog.Information($"[装修助手] 换招前核对：背包 {this.CountInContainers(BagContainers, null)} 件，仓库 {this.StoreroomDetail()}");
-    }
 
     private void StopJob(string why)
     {
@@ -1108,13 +1019,6 @@ public sealed class LKami9HousingHelper : ModuleBase
         {
             // 开工前的「仓库载入」准备：每帧只发一条指令，载入好了才开始搬
             if (this.PrepTick()) return;
-
-            // 「两步存入」（实验）有自己的节奏：每帧一条指令，先布置、再收回
-            if (this.job == MoveKind.PlaceThenStore)
-            {
-                this.PlaceThenStoreTick();
-                return;
-            }
 
             if (++this.jobWait < this.jobIntervalFrames) return;
             this.jobWait = 0;
@@ -1151,39 +1055,6 @@ public sealed class LKami9HousingHelper : ModuleBase
 
             if (this.jobCurrentTries >= 3)
             {
-                // 「存入」专用：三种发法依次实测（这条指令到底认哪个参数，只有试了才知道）。
-                // 只在「一件都没搬动」时换招，避免把单件失败误判成整条路走不通。
-                var srcNow = this.CountInContainers(BagContainers, null);
-                // 「存入」换招：一条都不动就换下一种发法；整套（5 种）试完再来一遍
-                // （有的发法需要前面几条指令把游戏侧的上下文"热"起来才生效，所以留了两轮）。
-                var inStoreFamily = IsStoreKind(this.job);
-                var nothingMoved = inStoreFamily && srcNow >= this.jobStartCount;
-
-                if (nothingMoved)
-                {
-                    this.storeLadderStep++;
-                    if (this.storeLadderStep < StoreLadder.Length)
-                    {
-                        this.SwitchStoreVariant(StoreLadder[this.storeLadderStep],
-                            $"存入：{StoreMethodName(this.job)} 一件都没搬动 → 换 {StoreMethodName(StoreLadder[this.storeLadderStep])} 重试");
-                        return;
-                    }
-
-                    this.storeLadderPass++;
-                    if (this.storeLadderPass < 2)
-                    {
-                        this.storeLadderStep = 0;
-                        this.SwitchStoreVariant(StoreLadder[0],
-                            $"存入：{StoreLadder.Length} 种发法都没搬动 → 第一轮结束，从头再来一遍（{StoreMethodName(StoreLadder[0])}）");
-                        return;
-                    }
-
-                    this.StopJob("存入失败：游戏没给「背包 → 房屋仓库」这条对外接口（1112 / 1113 / 1112带目标页 三种发法 "
-                               + "以及本地搬运 MoveItemSlot 都被服务器拒），请手动收纳，或用「收回已布置家具 → 仓库」"
-                               + "（把家具先布置到屋里再收回）。");
-                    return;
-                }
-
                 DalamudServices.PluginLog.Information(
                     $"[装修助手] 跳过：容器 {container} 槽位 {slot} 道具 {itemId}（连续 3 次没搬动）");
                 this.jobTried.Add((container, slot));
@@ -1208,15 +1079,6 @@ public sealed class LKami9HousingHelper : ModuleBase
             var type = (InventoryType)container;
             switch (this.job)
             {
-                case MoveKind.Store:
-                    HousingCommand.Store(type, (uint)slot);
-                    break;
-                case MoveKind.StoreAsStore:
-                    HousingCommand.Restore(type, (uint)slot, toStoreRoom: true);
-                    break;
-                case MoveKind.StoreAsDest:
-                    HousingCommand.Store(StoreroomDest(), (uint)slot);
-                    break;
                 case MoveKind.RetrieveToStore:
                     HousingCommand.Restore(type, (uint)slot, toStoreRoom: true);
                     break;
