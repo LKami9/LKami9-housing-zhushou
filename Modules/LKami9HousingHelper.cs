@@ -26,20 +26,19 @@ namespace LKami9.HousingHelper;
 /// <summary>
 /// LKami9装修助手 —— 批量搬运家具/庭具。
 ///
-/// 四个动作（全部走 OmenTools 的公开指令 API，不写内存）：
-///   · 批量存入     ：背包 家具/庭具 → 房屋仓库          ❌ 见下方「未打通」
+/// 三个动作（全部走 OmenTools 的公开指令 API，不写内存）：
 ///   · 批量取出     ：房屋仓库 家具/庭具 → 背包          HousingCommand.Restore(仓库, 槽, toStoreRoom:false)   ★实测有效
 ///   · 收回布置→背包：屋里/院里已摆放的 → 背包           HousingCommand.Restore(已布置, 槽, toStoreRoom:false) ★实测有效
 ///   · 收回布置→仓库：屋里/院里已摆放的 → 房屋仓库       HousingCommand.Restore(已布置, 槽, toStoreRoom:true)  ★实测有效
+/// 另带「家具清单」面板：列出背包里的 家具/庭具 与所在格子，方便对着手动收纳，存进仓库后自动划掉。
 ///
-/// 【「背包 → 仓库」为什么没打通】这条方向游戏没有对外接口，实测过两条路都被服务器拒：
-///   ① ExecuteCommandFlag 那一族：`StoreFurniture`(1112)、`RestoreFurniture`(1113+移仓标记)、
-///      1112 带「目标仓库页」—— 三种各 3 次、共 9 条，源侧一件不少。
-///   ② `InventoryManager.MoveItemSlot(背包, 槽, 27001, 空槽, false)` —— **这是个陷阱**：
-///      调用后源侧确实变少、界面看着像成功，但家具仓库里没有、游戏也没有收纳提示，
-///      **重新登录后道具又回到背包**（客户端本地搬了一下，服务器没收、随后回滚）。
-///      → 所以本模块已彻底移除 MoveItemSlot 用法；任何「本地搬运」都不能当成功，必须核对目标容器件数。
-///   现阶段请手动收纳，或先把家具布置到屋里再用「收回已布置家具 → 仓库」（这条实测有效）。
+/// 【「背包 → 房屋仓库」为什么没有按钮】这条方向游戏没有对外接口，实测过的每一条路都被拒：
+///   ① ExecuteCommandFlag：`StoreFurniture`(1112)、`RestoreFurniture`(1113+移仓标记)、1112 带「目标仓库页」
+///      —— 三种各 3 次、共 9 条，源侧一件不少。
+///   ② `InventoryManager.MoveItemSlot(背包, 槽, 27001, 空槽, false)` —— **陷阱**：调用后源侧变少、界面像成功，
+///      但仓库里没有、游戏也没有提示，**重登后道具回到背包**（本地搬了一下，服务器不收、回滚）。
+///   ③ `HousingCommand.Place`(PlaceFurnish 1150) 「先布置到屋里再收回」—— 布置连续 3 次没生效（道具留在背包）。
+///   → 所以现在只能手动收纳；「家具清单」面板就是为这件事铺路的（列出清单与格子、自动划掉已进的）。
 ///
 /// 容器号来自 FFXIVClientStructs 的 InventoryType（与 DailyRoutines 的「自动取回家具」同源）：
 ///   背包        Inventory1..4                  （0..3）
@@ -73,7 +72,7 @@ public sealed class LKami9HousingHelper : ModuleBase
     public override bool HasSettings => true;
 
     /// <summary>代码版本（只用于日志：一眼看出游戏里编的是哪一版）。</summary>
-    private const string ModuleVersion = "1.5.0";
+    private const string ModuleVersion = "1.5.1";
 
     // 宿主按「以 Config 结尾的成员」绑定已保存的配置；不能是 readonly
     private LKami9HousingHelperConfig config = new();
@@ -967,12 +966,7 @@ public sealed class LKami9HousingHelper : ModuleBase
 
 
 
-    // ══════════════════════════════════════════════════════════
-    //  「两步存入」（实验）：背包家具 → Place 布置到屋里 → Restore 收回仓库
-    // ══════════════════════════════════════════════════════════
-
-
-    /// <summary>某个容器的某个槽现在装着什么（0 = 空了 / 读不到）。</summary>
+    /// <summary>某个容器的某个槽现在装着什么（0 = 空了 / 读不到）—— 清单用来核对「这件是不是真的进仓库了」。</summary>
     private unsafe uint SlotItemId(int container, int slot)
     {
         var mgr = InventoryManager.Instance();

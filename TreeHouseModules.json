@@ -6,10 +6,10 @@
       "Name": "LKami9装修助手",
       "Author": "LKami9",
       "Description": "批量搬家具：仓库 → 背包、屋里/院里已摆放的 → 背包/仓库（实测可用）。另带「家具清单」面板：列出背包里的家具/庭具与所在格子，方便对着手动收纳，存进仓库后自动划掉。",
-      "Version": "1.5.0",
+      "Version": "1.5.1",
       "MinimumOmniVersion": "1.1.7.0",
       "File": "Modules/LKami9HousingHelper.cs",
-      "Sha256": "420883AF8C0E5CB56EE6AA0FA0271BFC889FDBBD0FE44C54A4DEA8DD1A99F9F4"
+      "Sha256": "F13F1F292407B56A3379A3A9A5532DBD1D97A0705BE6F5280F304961476D1E96"
     }
   ]
 }
