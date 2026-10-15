@@ -25,46 +25,52 @@ namespace LKami9.HousingHelper;
 /// <summary>
 /// LKami9装修助手 —— 批量搬运家具/庭具。
 ///
-/// 两个动作（都走游戏自己的「家具/庭具仓库」指令）：
-///   · 批量存入：背包里的家具/庭具 → 房屋仓库
-///   · 批量取出：房屋仓库里的家具/庭具 → 背包
+/// 四个动作（全部走 OmenTools 的公开指令 API，不碰内存）：
+///   · 批量存入     ：背包 家具/庭具 → 房屋仓库          HousingCommand.Store(背包, 槽)
+///   · 批量取出     ：房屋仓库 家具/庭具 → 背包          HousingCommand.Restore(仓库, 槽, toStoreRoom:false)
+///   · 收回布置→背包：屋里/院里已摆放的 → 背包           HousingCommand.Restore(已布置, 槽, toStoreRoom:false)
+///   · 收回布置→仓库：屋里/院里已摆放的 → 房屋仓库       HousingCommand.Restore(已布置, 槽, toStoreRoom:true)
+///
+/// 容器号来自 FFXIVClientStructs 的 InventoryType（与 DailyRoutines 的「自动取回家具」同源）：
+///   背包        Inventory1..4                  （0..3）
+///   室内已布置  HousingInteriorPlacedItems1..12（25003..25014）
+///   院内已布置  HousingExteriorPlacedItems     （25001）
+///   室内仓库    HousingInteriorStoreroom1..11  （27001..27011）
+///   院内仓库    HousingExteriorStoreroom(27000) / HousingExteriorStoreroom2(27200)
 ///
 /// 前置条件（游戏规则，绕不过）：
-///   · 必须在自己家 / 院子里（有房屋权限），否则游戏会拒绝
-///   · 建议先打开「家具/庭具仓库」窗口（收纳箱 / 房屋菜单），部分情况下游戏要求 UI 上下文
-///
-/// 指令来自 OmenTools（宿主自带，公开 API）：
-///   HousingCommand.Store(container, slot)                 → 存入仓库
-///   HousingCommand.Restore(container, slot, toStoreRoom:false) → 从仓库取回
-/// 容器号来自 FFXIVClientStructs 的 InventoryType：
-///   HousingExteriorStoreroom(27000) / HousingExteriorStoreroom2(27200)  → 庭具置场
-///   HousingInteriorStoreroom1..11(27001..27011)                         → 家具仓库
+///   · 必须在自己家 / 院子里（HousingManager 的房屋指针有值），否则游戏静默丢弃搬运指令
+///   · 家具界面要开着（DailyRoutines 的同功能模块就是把按钮挂在 HousingGoods 窗口上、
+///     要求玩家先打开家具界面再点开始）；本模块的「自动载入」只是尽力而为，
+///     载入不成功也照样发搬运指令，由「源侧一件都没少」兜住，不会静默卡死
 /// </summary>
 public sealed class LKami9HousingHelper : ModuleBase
 {
     public override ModuleInfo Info { get; } = new()
     {
         Title       = "LKami9装修助手",
-        Description = "批量搬家具：把背包里的家具/庭具一次存进房屋仓库，或把仓库里的家具/庭具批量取回背包。需要在自己家/院子里，建议先打开「家具/庭具仓库」窗口。",
+        Description = "批量搬家具：背包 ⇄ 房屋仓库、以及把屋里/院里已摆放的家具庭具收回背包或仓库。需要在自己家/院子里，并打开家具界面（家具/庭具窗口）。",
         Category    = ModuleCategory.Automation,
         Author      = "LKami9",
         Commands    =
         [
             new("批量存入（背包 → 仓库）", "/omni LKami9HousingHelper store"),
             new("批量取出（仓库 → 背包）", "/omni LKami9HousingHelper take"),
+            new("收回已布置家具 → 背包", "/omni LKami9HousingHelper pick"),
+            new("收回已布置家具 → 仓库", "/omni LKami9HousingHelper pack"),
         ],
     };
 
     public override bool HasSettings => true;
 
     /// <summary>代码版本（只用于日志：一眼看出游戏里编的是哪一版）。</summary>
-    private const string ModuleVersion = "1.1.3";
+    private const string ModuleVersion = "1.2.0";
 
     // 宿主按「以 Config 结尾的成员」绑定已保存的配置；不能是 readonly
     private LKami9HousingHelperConfig config = new();
 
     // ── 搬运状态 ──
-    private enum MoveKind { None, Store, TakeOut }
+    private enum MoveKind { None, Store, StoreAsStore, TakeOut, RetrieveToBag, RetrieveToStore }
 
     private MoveKind job = MoveKind.None;
     private int jobWait;                                   // 距上一件过了几帧
@@ -83,7 +89,7 @@ public sealed class LKami9HousingHelper : ModuleBase
     private int prepPhase;                                 // 0=不用准备 1=等几帧 2=发指令+等载入 3=仓库存档就绪 4=等玩家手动开窗
     private int prepWait;
     private int prepStepsDone;                             // 准备阶段已经发过几条载入指令
-    private string status = "空闲。先站到自己家里，再点下面两个按钮。";
+    private string status = "空闲。先站到自己家里，再点下面的按钮。";
 
     private readonly HashSet<(int Container, int Slot)> jobTried = [];
     private HashSet<uint>? furnitureIds;                   // 家具（HousingFurniture）
@@ -120,8 +126,7 @@ public sealed class LKami9HousingHelper : ModuleBase
         {
             DalamudServices.Framework.Update += this.OnFrameworkTick;
             this.frameworkHooked = true;
-            DalamudServices.PluginLog.Information(
-                $"[装修助手] 模块已加载，代码版本 v{ModuleVersion}（开工前自动载入房屋仓库）");
+            DalamudServices.PluginLog.Information($"[装修助手] 模块已加载，代码版本 v{ModuleVersion}");
         }
         catch (Exception ex) { DalamudServices.PluginLog.Information(ex, "[装修助手] 注册框架更新失败"); }
     }
@@ -157,6 +162,14 @@ public sealed class LKami9HousingHelper : ModuleBase
             case "take":
             case "取出":
                 this.StartJob(MoveKind.TakeOut);
+                return true;
+            case "pick":
+            case "收回背包":
+                this.StartJob(MoveKind.RetrieveToBag);
+                return true;
+            case "pack":
+            case "收回仓库":
+                this.StartJob(MoveKind.RetrieveToStore);
                 return true;
             default:
                 return false;
@@ -198,7 +211,13 @@ public sealed class LKami9HousingHelper : ModuleBase
             if (ImGui.IsItemHovered()) ImGui.SetTooltip("背包里的 家具/庭具 全部存进房屋仓库");
             ImGui.SameLine();
             if (ImGui.Button("批量取出（仓库 → 背包）")) this.StartJob(MoveKind.TakeOut);
-            if (ImGui.IsItemHovered()) ImGui.SetTooltip("仓库里的 家具/庭具 全部取回背包");
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("房屋仓库里的 家具/庭具 全部取回背包");
+
+            if (ImGui.Button("收回已布置家具 → 背包")) this.StartJob(MoveKind.RetrieveToBag);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("把屋里/院里已经摆放的 家具/庭具 全部收回背包（源：25001 / 25003~25014）");
+            ImGui.SameLine();
+            if (ImGui.Button("收回已布置家具 → 仓库")) this.StartJob(MoveKind.RetrieveToStore);
+            if (ImGui.IsItemHovered()) ImGui.SetTooltip("把屋里/院里已经摆放的 家具/庭具 全部收回房屋仓库（源：25001 / 25003~25014）");
         }
 
         ImGui.SameLine();
@@ -228,6 +247,8 @@ public sealed class LKami9HousingHelper : ModuleBase
         var bagYard = this.CountInContainers(BagContainers, this.yardIds);
         var (storeAll, storeDetail) = this.CountWithDetail(StoreroomContainers, null);
         var storeReady = this.AnyContainerLoaded(StoreroomContainers);
+        var (placedAll, placedDetail) = this.CountWithDetail(PlacedContainers, null);
+        var placedReady = this.AnyContainerLoaded(PlacedContainers);
 
         ImGui.TextDisabled($"背包：家具 {bagFur} 件 / 庭具 {bagYard} 件");
         if (storeReady)
@@ -238,8 +259,15 @@ public sealed class LKami9HousingHelper : ModuleBase
         else
         {
             ImGui.TextColored(OmniTheme.Tokens.Warning,
-                "仓库：没读到数据 —— 请先在自己家/院子里打开「家具/庭具仓库」窗口");
+                "仓库：没读到数据 —— 请先打开家具界面（家具/庭具窗口）再点");
         }
+
+        if (placedReady)
+            ImGui.TextDisabled($"已布置：共 {placedAll} 件　明细：{placedDetail}");
+        else
+            ImGui.TextColored(OmniTheme.Tokens.Warning, "已布置：没读到数据 —— 站在自己家/院子里时应该能读到");
+
+        ImGui.TextDisabled($"家具窗口（HousingGoods）：{DescribeStoreroomWindow()}");
 
         if (this.furnitureIds is { Count: 0 } && this.yardIds is { Count: 0 })
             ImGui.TextColored(OmniTheme.Tokens.Warning, "家具/庭具数据表读取失败（看 /xllog）");
@@ -249,7 +277,7 @@ public sealed class LKami9HousingHelper : ModuleBase
         if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(this.cachedStatusDetail))
             ImGui.SetTooltip(this.cachedStatusDetail);
 
-        ImGui.TextDisabled("用法：站到自己家（或院子）里 → 打开「家具/庭具仓库」→ 点上面两个按钮。");
+        ImGui.TextDisabled("用法：站到自己家（或院子）里 → 打开家具界面（家具/庭具窗口）→ 点上面四个按钮之一。");
     }
 
     /// <summary>
@@ -272,6 +300,7 @@ public sealed class LKami9HousingHelper : ModuleBase
         var toStore = this.CountInContainers(BagContainers, this.furnitureIds)
                     + this.CountInContainers(BagContainers, this.yardIds);
         var (store, storeDetail) = this.CountWithDetail(StoreroomContainers, null);
+        var (placed, placedDetail) = this.CountWithDetail(PlacedContainers, null);
         var house = GetHouseInfo();
 
         return string.Join(" | ",
@@ -281,6 +310,8 @@ public sealed class LKami9HousingHelper : ModuleBase
             $"本体容器 2/3={this.CountInContainers(IntermediateContainers, null)}",
             $"背包 {bag} 件（其中家具/庭具 {toStore} 件）",
             $"仓库 {store} 件（{storeDetail}）",
+            $"已布置 {placed} 件（{placedDetail}）",
+            $"家具窗口={DescribeStoreroomWindow()}",
             $"在自家区域={house.OwnTerritory} 房屋ID={house.HighId:X8}:{house.LowId:X8} 单元={house.Unit}",
             $"权限诊断 {house.PermissionText}");
     }
@@ -307,6 +338,44 @@ public sealed class LKami9HousingHelper : ModuleBase
         InventoryType.HousingInteriorStoreroom9, InventoryType.HousingInteriorStoreroom10,
         InventoryType.HousingInteriorStoreroom11,      // 27001~27011 家具仓库
     ];
+
+    /// <summary>已摆放的家具/庭具（室内 25003..25014 / 院内 25001）——「收回布置」的源。</summary>
+    private static readonly InventoryType[] PlacedContainers =
+    [
+        InventoryType.HousingExteriorPlacedItems,        // 25001 院子里已摆放的庭具
+        InventoryType.HousingInteriorPlacedItems1, InventoryType.HousingInteriorPlacedItems2,
+        InventoryType.HousingInteriorPlacedItems3, InventoryType.HousingInteriorPlacedItems4,
+        InventoryType.HousingInteriorPlacedItems5, InventoryType.HousingInteriorPlacedItems6,
+        InventoryType.HousingInteriorPlacedItems7, InventoryType.HousingInteriorPlacedItems8,
+        InventoryType.HousingInteriorPlacedItems9, InventoryType.HousingInteriorPlacedItems10,
+        InventoryType.HousingInteriorPlacedItems11, InventoryType.HousingInteriorPlacedItems12,
+    ];
+
+    /// <summary>这个动作的「源侧容器」是哪一批。</summary>
+    private static InventoryType[] SourceContainers(MoveKind kind) => kind switch
+    {
+        MoveKind.Store or MoveKind.StoreAsStore => BagContainers,
+        MoveKind.RetrieveToBag or MoveKind.RetrieveToStore => PlacedContainers,
+        _ => StoreroomContainers,
+    };
+
+    /// <summary>源侧的名字（日志/界面用）。</summary>
+    private static string SourceNoun(MoveKind kind) => kind switch
+    {
+        MoveKind.Store or MoveKind.StoreAsStore => "背包",
+        MoveKind.RetrieveToBag or MoveKind.RetrieveToStore => "已布置",
+        _ => "仓库",
+    };
+
+    /// <summary>动作名（日志/界面用）。</summary>
+    private static string ActionName(MoveKind kind) => kind switch
+    {
+        MoveKind.Store => "存入（背包 → 仓库）",
+        MoveKind.StoreAsStore => "存入（背包 → 仓库·改用 1113）",
+        MoveKind.RetrieveToBag => "收回已布置 → 背包",
+        MoveKind.RetrieveToStore => "收回已布置 → 仓库",
+        _ => "取出（仓库 → 背包）",
+    };
 
     /// <summary>身上的容器：只为了诊断「背包那一栏到底读没读到」。</summary>
     private static readonly InventoryType[] IntermediateContainers =
@@ -495,7 +564,7 @@ public sealed class LKami9HousingHelper : ModuleBase
 
     private void StartJob(MoveKind kind)
     {
-        var what = kind == MoveKind.Store ? "存入" : "取出";
+        var what = ActionName(kind);
         DalamudServices.PluginLog.Information($"[装修助手] ===== 开始{what}（代码版本 v{ModuleVersion}）=====");
 
         // ① 建索引（失败也照样往下走，日志里能看到数量）
@@ -513,13 +582,13 @@ public sealed class LKami9HousingHelper : ModuleBase
         DalamudServices.PluginLog.Information(
             $"[装修助手] 前置③房屋：在自家区域={house.OwnTerritory} 房屋ID={house.HighId:X8}:{house.LowId:X8} 单元={house.Unit} {house.PermissionText}");
 
-        var srcTypes = kind == MoveKind.Store ? BagContainers : StoreroomContainers;
+        var srcTypes = SourceContainers(kind);
         var (srcAll, srcDetail) = this.CountWithDetail(srcTypes, null);
-        var srcMatch = kind == MoveKind.Store
+        var srcMatch = kind is MoveKind.Store or MoveKind.StoreAsStore
             ? this.CountInContainers(BagContainers, this.furnitureIds) + this.CountInContainers(BagContainers, this.yardIds)
             : srcAll;
         DalamudServices.PluginLog.Information(
-            $"[装修助手] 前置④容器：{(kind == MoveKind.Store ? "背包" : "仓库")} {srcAll} 件（其中要搬 {srcMatch} 件）明细 {srcDetail}");
+            $"[装修助手] 前置④容器：{SourceNoun(kind)} {srcAll} 件（其中要搬 {srcMatch} 件）明细 {srcDetail}");
 
         // 守卫 1：索引空
         if (idxFur <= 0 && idxYard <= 0)
@@ -550,17 +619,18 @@ public sealed class LKami9HousingHelper : ModuleBase
         // 守卫 4：源侧根本没有要搬的东西
         if (srcMatch <= 0)
         {
-            DalamudServices.PluginLog.Information($"[装修助手] 中止：{(kind == MoveKind.Store ? "背包" : "仓库")}里没有要搬的家具/庭具（0 件）");
-            this.status = kind == MoveKind.Store
+            DalamudServices.PluginLog.Information($"[装修助手] 中止：{SourceNoun(kind)}里没有要搬的家具/庭具（0 件）");
+            this.status = kind is MoveKind.Store or MoveKind.StoreAsStore
                 ? "背包里没找到家具/庭具（或没勾对应的范围）。"
-                : "仓库里没读到家具/庭具 —— 先打开「家具/庭具仓库」窗口。";
+                : $"没读到要搬的东西（{SourceNoun(kind)}）—— 盖上家具界面（家具/庭具窗口）再点一次。";
             return;
         }
 
-        var ready = this.AnyContainerLoaded(StoreroomContainers);
+        var storeReady = this.AnyContainerLoaded(StoreroomContainers);
+        var placedReady = this.AnyContainerLoaded(PlacedContainers);
         DalamudServices.PluginLog.Information(
-            $"[装修助手] 前置⑤仓库存档：已载入={ready} 仓库窗口={DescribeStoreroomWindow()}"
-            + (ready ? "" : "（没载入 → 自动依次发 5 条载入/请求指令；都不行就等你手动开「家具/庭具仓库」窗口）"));
+            $"[装修助手] 前置⑤容器状态：仓库已载入={storeReady} 已布置已载入={placedReady} 家具窗口={DescribeStoreroomWindow()}"
+            + (storeReady || placedReady ? "" : "（都没载入 → 先尽力发 3 条载入指令，之后照常尝试搬运）"));
 
         this.job = kind;
         this.jobWait = 0;
@@ -578,35 +648,34 @@ public sealed class LKami9HousingHelper : ModuleBase
         this.jobDoneFrames = 0;
         this.jobDoneBaseline = srcAll;
 
-        if (ready)
+        if (storeReady || placedReady || kind is MoveKind.Store or MoveKind.StoreAsStore)
         {
-            // 仓库存档已经在手里，直接开工
+            // 源侧数据已经在手里（背包天然可读）→ 直接开工
             this.prepPhase = 3;
             this.prepWait = 0;
-            this.status = kind == MoveKind.Store
-                ? $"开始存入：共 {srcMatch} 件家具/庭具…"
-                : $"开始取出：仓库里共 {srcMatch} 件…";
+            this.status = $"开始{what}：源侧 {srcAll} 件（要搬 {srcMatch} 件）…";
             DalamudServices.PluginLog.Information(
                 $"[装修助手] 开始{what}：源侧 {srcAll} 件（要搬 {srcMatch} 件），每件间隔 {this.jobIntervalFrames} 帧");
             return;
         }
 
-        // 仓库存档没载入 → 先准备（发载入指令 + 等载入），准备好了再真正开工
+        // 源侧（仓库 / 已布置）没读到数据 → 先尽力发载入指令等一会儿；
+        // 之后无论载入成功与否都照常往下走（由「源侧一件都没少」兜住，不再直接停手）。
         this.prepPhase = 1;
         this.prepWait = 0;
-        this.status = "准备中：正在载入房屋仓库…";
-        DalamudServices.PluginLog.Information($"[装修助手] 准备{what}：等待房屋仓库载入…");
+        this.status = "准备中：先试着把家具界面里的仓库数据叫出来…";
+        DalamudServices.PluginLog.Information($"[装修助手] 准备{what}：先尝试自动载入（载入失败也会继续尝试搬运）");
     }
 
     /// <summary>
     /// 开工前的「仓库载入」准备：逐帧推进（同一帧连发多条指令游戏只处理一条）。
-    /// 自动依次试 5 条「载入/请求仓库」指令；全都不行就转入「等玩家手动开窗」，
-    /// 玩家一打开「家具/庭具仓库」窗口就立刻开工（不用再点一次按钮）。
-    /// 返回 true = 这帧已被准备流程占用，搬运逻辑不要动。
+    /// 只是尽力而为 —— 发 3 条指令、每步等 1 秒，之后无论载入成功与否都放行；
+    /// 真正判断有没有搬动靠「源侧件数有没有变少」。
+    /// 返回 true = 这帧还在准备，搬运逻辑不要动。
     /// </summary>
     private unsafe bool PrepTick()
     {
-        if (this.prepPhase >= 3) return false;
+        if (this.prepPhase == 3) return false;
 
         // phase 1：先等 6 帧（让「准备中」的状态行显示出来），再发第 1 条指令
         if (this.prepPhase == 1)
@@ -617,10 +686,8 @@ public sealed class LKami9HousingHelper : ModuleBase
             var house = GetHouseInfo();
             if (house.HighId == 0 && house.LowId == 0)
             {
-                DalamudServices.PluginLog.Information("[装修助手] 准备失败：不在自家房屋区域，发不了载入指令");
-                this.job = MoveKind.None;
-                this.prepPhase = 0;
-                this.status = "准备失败：不在自己家/院子里 —— 先回去再点。";
+                DalamudServices.PluginLog.Information("[装修助手] 准备跳过：不在自家房屋区域，载入指令发不出去");
+                this.PrepGiveUp("（不在自家房屋区域，先回自己家/院子里）");
                 return true;
             }
 
@@ -629,42 +696,8 @@ public sealed class LKami9HousingHelper : ModuleBase
             return true;
         }
 
-        // phase 4：自动指令全失败 → 等玩家手动打开「家具/庭具仓库」窗口（最多 1 分钟）
-        if (this.prepPhase == 4)
-        {
-            if (this.AnyContainerLoaded(StoreroomContainers))
-            {
-                this.PrepDone();
-                return false;
-            }
-
-            if (this.prepWait >= PrepManualWaitFrames)
-            {
-                DalamudServices.PluginLog.Information(
-                    $"[装修助手] 准备失败：{PrepStepNames.Length} 条自动指令 + 等 {PrepManualWaitFrames / 60} 秒都没读到仓库，"
-                    + $"仓库窗口={DescribeStoreroomWindow()}，容器明细 {this.CountWithDetail(StoreroomContainers, null).Detail}"
-                    + " → 需要玩家手动打开「家具/庭具仓库」窗口");
-                this.job = MoveKind.None;
-                this.prepPhase = 0;
-                this.status = "读不到房屋仓库 —— 请在自己家（或院子里）打开「家具/庭具仓库」窗口，再点一次。";
-                return true;
-            }
-
-            if (this.prepWait % 300 == 0)   // 每 5 秒提示一次
-            {
-                var leftSec = (PrepManualWaitFrames - this.prepWait) / 60;
-                DalamudServices.PluginLog.Information(
-                    $"[装修助手] 等待手动开窗：请在自家（或院子里）打开「家具/庭具仓库」窗口（还剩约 {leftSec} 秒），"
-                    + $"当前仓库窗口={DescribeStoreroomWindow()}");
-                this.status = $"请打开「家具/庭具仓库」窗口（还剩约 {leftSec} 秒，打开就自动开始）";
-            }
-
-            this.prepWait++;
-            return true;
-        }
-
-        // phase 2：每帧读一次原生容器（只读，无副作用），看仓库有没有载入
-        if (this.AnyContainerLoaded(StoreroomContainers))
+        // phase 2：每帧读一次原生容器（只读，无副作用），看源侧有没有载入
+        if (this.AnyContainerLoaded(SourceContainers(this.job)))
         {
             this.PrepDone();
             return false;
@@ -678,33 +711,37 @@ public sealed class LKami9HousingHelper : ModuleBase
             return true;
         }
 
-        // 自动指令全试过还是没载入 → 不再硬发（会被游戏无视），转为等玩家手动开窗
+        // 3 条都发过还是没读到 → 放行（照常发搬运指令，靠「源侧没变少」判断并停手）
         DalamudServices.PluginLog.Information(
-            $"[装修助手] 自动载入没生效（已依次发过 {PrepStepNames.Length} 条指令），"
-            + $"仓库窗口={DescribeStoreroomWindow()} → 转为等玩家手动打开「家具/庭具仓库」窗口（最多 {PrepManualWaitFrames / 60} 秒）");
-        this.prepPhase = 4;
-        this.prepWait = 0;
+            $"[装修助手] 自动载入没生效（发过 {PrepStepNames.Length} 条指令，家具窗口={DescribeStoreroomWindow()}）"
+            + " → 照常尝试搬运；若源侧一直不变少，说明游戏侧还没被满足（需要开着家具界面 / 换室内外位置）");
+        this.PrepGiveUp("");
         return true;
     }
 
-    /// <summary>每条载入/请求指令给多少帧（60 帧 ≈ 1 秒）。</summary>
-    private const int PrepStepWaitFrames = 90;
+    /// <summary>准备阶段全部没成功 → 不再拦着，直接放行开工（附一句人话原因）。</summary>
+    private void PrepGiveUp(string reason)
+    {
+        this.prepPhase = 3;
+        this.prepWait = 0;
+        this.jobDoneFrames = 0;
+        this.jobDoneBaseline = this.CountInContainers(SourceContainers(this.job), null);
+        this.status = $"直接开始{ActionName(this.job)}（没自动载入到仓库数据{reason}），源侧一件没变少就会自动停。";
+    }
 
-    /// <summary>自动指令全失败后，再等玩家手动开窗多少帧（3600 帧 ≈ 60 秒）。</summary>
-    private const int PrepManualWaitFrames = 3600;
+    /// <summary>每条载入/请求指令给多少帧（60 帧 ≈ 1 秒）。</summary>
+    private const int PrepStepWaitFrames = 60;
 
     /// <summary>准备阶段依次尝试的载入/请求指令（日志里会说清是哪一步生效的）。</summary>
     private static readonly string[] PrepStepNames =
     [
         "载入室内家具仓库（LoadInteriorFurnish 1111）",
-        "载入院内庭具仓库（LoadExteriorFurnish 1110）",
         "请求仓库状态（RequestStoreroomStatus 1151）",
-        "再试一次载入室内家具仓库（1111）",
-        "再试一次请求仓库状态（1151）",
+        "载入院内庭具仓库（LoadExteriorFurnish 1110）",
     ];
 
     /// <summary>每条指令对应哪个动作：0=室内家具 1=院内庭具 2=请求仓库状态。</summary>
-    private static readonly int[] PrepStepAction = [0, 1, 2, 0, 2];
+    private static readonly int[] PrepStepAction = [0, 2, 1];
 
     private unsafe void PrepSendStep(int index, HouseInfo house)
     {
@@ -727,8 +764,8 @@ public sealed class LKami9HousingHelper : ModuleBase
         var leftSec = (PrepStepNames.Length - index - 1) * PrepStepWaitFrames / 60f;
         DalamudServices.PluginLog.Information(
             $"[装修助手] 准备第 {index + 1}/{PrepStepNames.Length} 步：{PrepStepNames[index]}"
-            + $"（房屋 {house.HighId:X8}:{house.LowId:X8}，仓库窗口={DescribeStoreroomWindow()}），等 1.5 秒");
-        this.status = $"正在载入房屋仓库…（第 {index + 1}/{PrepStepNames.Length} 步，别点停止，还剩约 {leftSec:0.#} 秒）";
+            + $"（房屋 {house.HighId:X8}:{house.LowId:X8}，家具窗口={DescribeStoreroomWindow()}），等 1 秒");
+        this.status = $"正在尝试载入仓库数据…（第 {index + 1}/{PrepStepNames.Length} 步，还剩约 {leftSec:0.#} 秒）";
     }
 
     /// <summary>看一眼「家具/庭具仓库」窗口（HousingGoods）什么状态 —— 只读，用来判断指令有没有把窗口叫出来。</summary>
@@ -743,27 +780,25 @@ public sealed class LKami9HousingHelper : ModuleBase
         return addon->IsVisible ? "已打开" : "已创建未显示";
     }
 
-    /// <summary>仓库载入成功 → 正式开工。</summary>
+    /// <summary>源侧数据载入成功 → 正式开工。</summary>
     private void PrepDone()
     {
-        var (n, detail) = this.CountWithDetail(StoreroomContainers, null);
+        var srcTypes0 = SourceContainers(this.job);
+        var (n, detail) = this.CountWithDetail(srcTypes0, null);
         DalamudServices.PluginLog.Information(
-            $"[装修助手] 准备完成：房屋仓库已载入（约在第 {this.prepStepsDone} 步之后），共 {n} 件，明细 {detail}");
+            $"[装修助手] 准备完成：{SourceNoun(this.job)}数据已载入（约在第 {this.prepStepsDone} 步之后），共 {n} 件，明细 {detail}");
 
         this.prepPhase = 3;
         this.prepWait = 0;
         this.jobDoneFrames = 0;
 
-        var srcTypes = this.job == MoveKind.Store ? BagContainers : StoreroomContainers;
-        var (again, _) = this.CountWithDetail(srcTypes, null);
+        var (again, _) = this.CountWithDetail(srcTypes0, null);
         this.jobStartCount = again;
         this.jobDoneBaseline = again;
 
-        this.status = this.job == MoveKind.Store
-            ? $"开始存入：共 {this.jobStartMatch} 件家具/庭具…"
-            : $"开始取出：仓库里共 {again} 件…";
+        this.status = $"开始{ActionName(this.job)}：源侧共 {again} 件…";
         DalamudServices.PluginLog.Information(
-            $"[装修助手] 开始{(this.job == MoveKind.Store ? "存入" : "取出")}：源侧 {again} 件（要搬 {this.jobStartMatch} 件），每件间隔 {this.jobIntervalFrames} 帧");
+            $"[装修助手] 开始{ActionName(this.job)}：源侧 {again} 件（要搬 {this.jobStartMatch} 件），每件间隔 {this.jobIntervalFrames} 帧");
     }
 
     private void StopJob(string why)
@@ -774,7 +809,7 @@ public sealed class LKami9HousingHelper : ModuleBase
         this.prepPhase = 0;
         this.prepWait = 0;
 
-        var srcTypes = kind == MoveKind.Store ? BagContainers : StoreroomContainers;
+        var srcTypes = SourceContainers(kind);
         var (left, leftDetail) = this.CountWithDetail(srcTypes, null);
         var moved = Math.Max(0, this.jobStartCount - left);
 
@@ -802,7 +837,7 @@ public sealed class LKami9HousingHelper : ModuleBase
             var loopDetail = "";
             if (this.job != MoveKind.None && this.jobSent > 0)
             {
-                var srcTypes = this.job == MoveKind.Store ? BagContainers : StoreroomContainers;
+                var srcTypes = SourceContainers(this.job);
                 var now = this.CountInContainers(srcTypes, null);
                 if (now < this.jobDoneBaseline)
                 {
@@ -811,7 +846,7 @@ public sealed class LKami9HousingHelper : ModuleBase
                 }
                 else if (++this.jobDoneFrames >= 8)
                 {
-                    loopDetail = "（源侧一件都没少：指令可能被游戏拒了 —— 仓库满 / 没打开仓库窗口 / 不是自己的房子）";
+                    loopDetail = "（源侧一件都没少：指令可能被游戏拒了 —— 家具界面没开 / 仓库满 / 不是自己的房子 / 物品类型不对）";
                 }
             }
 
@@ -830,6 +865,24 @@ public sealed class LKami9HousingHelper : ModuleBase
 
             if (this.jobCurrentTries >= 3)
             {
+                // 存入专用：1112（StoreFurniture）被游戏丢弃时，换成 1113 带「移到仓库」标记再试一轮。
+                // 这是唯一能确定「游戏到底认哪条指令」的实测办法（参考实现 DailyRoutines 只用了 1113）。
+                if (this.job == MoveKind.Store)
+                {
+                    this.job = MoveKind.StoreAsStore;
+                    this.jobTried.Clear();
+                    this.jobCurrent = (-1, -1);
+                    this.jobCurrentTries = 0;
+                    this.jobSkipStreak = 0;
+                    this.jobSent = 0;
+                    this.jobDoneFrames = 0;
+                    this.jobDoneBaseline = this.CountInContainers(BagContainers, null);
+                    DalamudServices.PluginLog.Information(
+                        "[装修助手] 存入指令 1112（StoreFurniture）3 次没搬动 → 改用 1113（RestoreFurniture + 移到仓库标记）重试同一批");
+                    this.status = "存入：1112 没被接受，改用 1113 再试…";
+                    return;
+                }
+
                 DalamudServices.PluginLog.Information(
                     $"[装修助手] 跳过：容器 {container} 槽位 {slot} 道具 {itemId}（连续 3 次没搬动）");
                 this.jobTried.Add((container, slot));
@@ -840,7 +893,7 @@ public sealed class LKami9HousingHelper : ModuleBase
 
                 if (this.jobSkipStreak >= 10)
                 {
-                    this.StopJob("连续 10 件都搬不动 —— 可能是仓库已满 / 没打开仓库窗口 / 不在自己家。" + loopDetail);
+                    this.StopJob($"连续 10 件都搬不动（{SourceNoun(this.job)} → 目标没成功）。" + loopDetail);
                     return;
                 }
 
@@ -852,10 +905,21 @@ public sealed class LKami9HousingHelper : ModuleBase
                 return;
             }
             var type = (InventoryType)container;
-            if (this.job == MoveKind.Store)
-                HousingCommand.Store(type, (uint)slot);
-            else
-                HousingCommand.Restore(type, (uint)slot, toStoreRoom: false);
+            switch (this.job)
+            {
+                case MoveKind.Store:
+                    HousingCommand.Store(type, (uint)slot);
+                    break;
+                case MoveKind.StoreAsStore:
+                    HousingCommand.Restore(type, (uint)slot, toStoreRoom: true);
+                    break;
+                case MoveKind.RetrieveToStore:
+                    HousingCommand.Restore(type, (uint)slot, toStoreRoom: true);
+                    break;
+                default:
+                    HousingCommand.Restore(type, (uint)slot, toStoreRoom: false);
+                    break;
+            }
 
             this.jobSent++;
             this.jobCurrentTries++;
@@ -865,12 +929,11 @@ public sealed class LKami9HousingHelper : ModuleBase
             if (++this.jobSrcRefresh >= 15)
             {
                 this.jobSrcRefresh = 0;
-                var st = this.job == MoveKind.Store ? BagContainers : StoreroomContainers;
+                var st = SourceContainers(this.job);
                 this.jobSrcNow = this.CountInContainers(st, null);
             }
             var movedNow = Math.Max(0, this.jobStartCount - this.jobSrcNow);
-            this.status = (this.job == MoveKind.Store ? "存入中…" : "取出中…")
-                        + $" 已搬 {movedNow} 件 / 已发 {this.jobSent} 次指令"
+            this.status = $"{ActionName(this.job)}中… 已搬 {movedNow} 件 / 已发 {this.jobSent} 次指令"
                         + (this.jobSkipped > 0 ? $"，跳过 {this.jobSkipped} 件（游戏没收）" : "");
         }
         catch (Exception ex)
@@ -890,7 +953,7 @@ public sealed class LKami9HousingHelper : ModuleBase
         var mgr = InventoryManager.Instance();
         if (mgr == null) return false;
 
-        var types = this.job == MoveKind.Store ? BagContainers : StoreroomContainers;
+        var types = SourceContainers(this.job);
         foreach (var type in types)
         {
             var cont = mgr->GetInventoryContainer(type);
